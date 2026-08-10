@@ -1,0 +1,115 @@
+# Deploy do MyZap da Magazine no GKE.
+#
+# ⚠️ MANUAL DE PROPÓSITO (workflow_dispatch). Duas razões:
+#
+# 1. Este repo é um FORK — merges do upstream trazem commits que não são nossos,
+#    e nenhum deles deve mexer em produção sozinho.
+# 2. Atualizar imagem aqui significa, em algum momento, apagar o pod — e apagar o
+#    pod desconecta as sessões de WhatsApp. O upstream aprendeu isso com o pm2
+#    (dois pushes em 10/06/2026 derrubaram uma sessão que precisou de QR novo).
+#
+# Por isso o StatefulSet usa `updateStrategy: OnDelete`: este workflow publica a
+# imagem e atualiza o manifest, mas o pod só troca quando alguém rodar
+# `kubectl -n whatsapp delete pod myzap-0`. Trocar de versão é uma decisão, não
+# um efeito colateral de um commit.
+#
+# Variables/Secrets do repo (Settings → Secrets and variables → Actions):
+#   var  APP_PROJECT_ID                 = mgp-whatsapp-prod
+#   var  GCP_WORKLOAD_IDENTITY_PROVIDER = projects/.../providers/...  (igual aos outros apps)
+#   var  GCP_SERVICE_ACCOUNT            = github-actions-prod@mgp-whatsapp-prod.iam.gserviceaccount.com
+#   sec  MYZAP_ENV_FILE                 = .env do MyZap (TOKEN mestre, JWT_SECRET, COMPANY...)
+name: Deploy MyZap to GKE
+
+on:
+  workflow_dispatch:
+    inputs:
+      reiniciar_pod:
+        description: "Apagar o pod para subir a imagem nova? DERRUBA as sessões conectadas."
+        type: boolean
+        default: false
+
+env:
+  REGION: southamerica-east1
+  REGISTRY: southamerica-east1-docker.pkg.dev/${{ vars.APP_PROJECT_ID }}/magazinedopovo-docker-prod
+  IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+  CLUSTER: magazinedopovo-gke-prod
+  ZONE: southamerica-east1-a
+  NS: whatsapp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/myzap:${{ env.IMAGE_TAG }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/myzap:cache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/myzap:cache,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: magazinedopovo-infra   # o cluster vive no projeto compartilhado
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.ZONE }}
+
+      - name: Namespace
+        run: kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: ServiceAccount (Workload Identity)
+        run: |
+          kubectl -n "$NS" create serviceaccount myzap --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NS" annotate serviceaccount myzap \
+            iam.gke.io/gcp-service-account="myzap-app-prod@${{ vars.APP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --overwrite
+
+      - name: Secret (a partir do MYZAP_ENV_FILE)
+        env:
+          MYZAP_ENV_FILE: ${{ secrets.MYZAP_ENV_FILE }}
+        run: |
+          printf '%s' "$MYZAP_ENV_FILE" > /tmp/myzap.env
+          kubectl -n "$NS" create secret generic myzap-secrets --from-env-file=/tmp/myzap.env \
+            --dry-run=client -o yaml | kubectl apply -f -
+          rm -f /tmp/myzap.env
+
+      - name: Aplica manifests
+        run: |
+          sed -e "s|__REGISTRY__|${REGISTRY}|g" -e "s|__TAG__|${IMAGE_TAG}|g" k8s/myzap.yaml | kubectl apply -f -
+
+      - name: Trocar a imagem do pod (só se pedirem)
+        if: ${{ inputs.reiniciar_pod }}
+        run: |
+          kubectl -n "$NS" delete pod myzap-0 --wait=false || true
+          kubectl -n "$NS" rollout status statefulset/myzap --timeout=600s
+
+      - name: Estado
+        run: |
+          kubectl -n "$NS" get statefulset,pod,pvc,svc -o wide
+          echo
+          echo "Imagem publicada: ${REGISTRY}/myzap:${IMAGE_TAG}"
+          if [ "${{ inputs.reiniciar_pod }}" != "true" ]; then
+            echo "O pod NÃO foi trocado (OnDelete). Para subir esta imagem:"
+            echo "  kubectl -n $NS delete pod myzap-0    # derruba as sessões conectadas"
+          fi

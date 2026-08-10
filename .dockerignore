@@ -1,0 +1,13 @@
+# A imagem não leva o que é estado local nem lixo de dev — em produção
+# `instances/` e `database/` vêm do volume, não da imagem.
+.git
+.github
+node_modules
+instances
+database
+logs
+*.log
+docs
+.env
+.envcopy
+.env.otimizacoes

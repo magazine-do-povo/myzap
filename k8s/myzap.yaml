@@ -1,0 +1,119 @@
+# MyZap da Magazine — StatefulSet, e o motivo de não ser Deployment.
+#
+# O estado da sessão de WhatsApp Web vive em DISCO (`instances/<sessao>/`: perfil
+# do Chrome + tokens) e o banco é um SQLite em `database/`. Com Deployment +
+# RollingUpdate, o pod novo sobe ANTES de o antigo morrer: os dois abririam o
+# mesmo perfil do Chrome e a mesma sessão, e o WhatsApp derruba o número.
+#
+# Por isso:
+#   - StatefulSet com 1 réplica (nunca 2 — não escala horizontal por desenho)
+#   - volumeClaimTemplates (o disco é a identidade do pod)
+#   - updateStrategy OnDelete: subir imagem nova NÃO reinicia sozinho. A sessão
+#     só cai quando alguém apagar o pod de propósito. É a mesma lição que o
+#     upstream aprendeu com o pm2 (deploy derrubava chip conectado).
+apiVersion: v1
+kind: Service
+metadata:
+  name: myzap
+  namespace: whatsapp
+  labels: { app: myzap }
+spec:
+  type: ClusterIP
+  selector: { app: myzap }
+  ports:
+    - name: http
+      port: 3333
+      targetPort: 3333
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: myzap
+  namespace: whatsapp
+  labels: { app: myzap }
+spec:
+  serviceName: myzap
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels: { app: myzap }
+  template:
+    metadata:
+      labels: { app: myzap }
+    spec:
+      serviceAccountName: myzap
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: myzap
+          image: __REGISTRY__/myzap:__TAG__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3333
+          envFrom:
+            - secretRef:
+                name: myzap-secrets
+          env:
+            - name: PORT
+              value: "3333"
+            - name: PRODUCTION
+              value: "true"
+            # Reconecta as sessões salvas no volume ao subir — é o que evita QR
+            # novo depois de um restart.
+            - name: START_ALL_SESSIONS
+              value: "true"
+            - name: USE_CHROME
+              value: "true"
+            - name: ENGINE
+              value: "2"
+          resources:
+            requests:
+              cpu: "300m"
+              # Cada sessão é um Chrome. Este número é para UMA sessão e precisa
+              # ser remedido antes de subir a segunda e a terceira.
+              memory: "1.5Gi"
+            limits:
+              cpu: "2"
+              memory: "3Gi"
+          # /health responde sem depender de I/O de banco (o upstream tomou
+          # cuidado com isso de propósito), então serve de liveness sem risco de
+          # matar o pod por SQLite lento.
+          livenessProbe:
+            httpGet: { path: /health, port: 3333 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet: { path: /health, port: 3333 }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: dados
+              mountPath: /app/instances
+              subPath: instances
+            - name: dados
+              mountPath: /app/database
+              subPath: database
+            # O Chromium quer memória compartilhada; sem isto ele cai com
+            # "Target closed" na primeira aba.
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 20Gi
