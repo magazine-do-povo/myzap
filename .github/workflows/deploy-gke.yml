@@ -101,7 +101,18 @@ jobs:
       - name: Trocar a imagem do pod (só se pedirem)
         if: ${{ inputs.reiniciar_pod }}
         run: |
-          kubectl -n "$NS" delete pod myzap-0 --wait=false || true
+          # --wait=true (default) para o pod SUMIR antes de esperar o novo: com
+          # --wait=false o passo seguinte corria e batia em "pods myzap-0 not
+          # found", porque o StatefulSet ainda não tinha recriado.
+          kubectl -n "$NS" delete pod myzap-0 || true
+
+          # E o pod tem de EXISTIR antes de `wait --for=condition=Ready` — o wait
+          # falha na hora se o objeto não existe, em vez de esperar por ele.
+          for _ in $(seq 1 60); do
+            kubectl -n "$NS" get pod myzap-0 >/dev/null 2>&1 && break
+            sleep 5
+          done
+
           # `rollout status` NÃO funciona com updateStrategy OnDelete ("rollout
           # status is only available for RollingUpdate strategy type") — espera-se
           # o pod, que é o que interessa.

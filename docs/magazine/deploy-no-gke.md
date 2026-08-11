@@ -76,6 +76,7 @@ O secret `myzap-secrets` é gerado pelo workflow a partir do `MYZAP_ENV_FILE`. O
 | `CORS_ORIGIN` | quem pode chamar a API pelo navegador |
 | `OPENAI_API_KEY` | **obrigatória para o processo SUBIR**, mesmo sem IA: `controllers/helper/events/audioTranscriber.js` instancia o cliente OpenAI no `require`, e sem a variável o Node morre no boot (`CrashLoopBackOff`). Aqui vai um valor inócuo — este servidor só manda texto; se alguém ligar transcrição de áudio, vai tomar 401 da OpenAI, que é o certo |
 | `EMAIL_TOKEN` | vazio. Sem ela sai só um `[WARNING] [EMAIL ALERT]` no log |
+| `EMAIL` | **obrigatória para CRIAR SESSÃO.** Os três engines fazem `User.findOne({ where: { email: process.env.EMAIL } })` para vincular o device ao usuário do sistema (`engines/WppConnect.js:77`, `Venom.js:30`, `WhatsappWebJS.js:76`). Sem ela o Sequelize aborta com `WHERE parameter "email" has invalid "undefined" value`, e a sessão morre calada: o `/start` responde `STARTING` e o `getConnectionStatus` diz que a sessão "não existe" |
 
 `PORT`, `PRODUCTION`, `START_ALL_SESSIONS`, `USE_CHROME` e `ENGINE` já vêm fixados no manifest —
 não repita no env file.
