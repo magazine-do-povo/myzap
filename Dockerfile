@@ -38,7 +38,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # O install vem antes do código para aproveitar a camada em build seguinte.
+#
+# `scripts/` entra junto porque o `postinstall` do MyZap roda
+# `scripts/patch-whatsapp.js` — sem ele o install morre com MODULE_NOT_FOUND. O
+# patch corrige o whatsapp-web.js ("markedUnread") e precisa rodar DEPOIS do
+# node_modules existir, que é exatamente onde o postinstall roda.
 COPY package.json pnpm-lock.yaml .npmrc ./
+COPY scripts ./scripts
 RUN corepack enable && corepack prepare pnpm@latest --activate \
     # `--prod` ficaria sem o que o postinstall (scripts/patch-whatsapp.js) precisa,
     # e o patch é o que mantém o wppconnect falando com o WhatsApp Web atual.
