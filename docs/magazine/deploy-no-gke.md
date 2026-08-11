@@ -74,6 +74,8 @@ O secret `myzap-secrets` é gerado pelo workflow a partir do `MYZAP_ENV_FILE`. O
 | `JWT_SECRET` | sessão do painel |
 | `COMPANY` / `LOGO` | identidade no painel e nas páginas |
 | `CORS_ORIGIN` | quem pode chamar a API pelo navegador |
+| `OPENAI_API_KEY` | **obrigatória para o processo SUBIR**, mesmo sem IA: `controllers/helper/events/audioTranscriber.js` instancia o cliente OpenAI no `require`, e sem a variável o Node morre no boot (`CrashLoopBackOff`). Aqui vai um valor inócuo — este servidor só manda texto; se alguém ligar transcrição de áudio, vai tomar 401 da OpenAI, que é o certo |
+| `EMAIL_TOKEN` | vazio. Sem ela sai só um `[WARNING] [EMAIL ALERT]` no log |
 
 `PORT`, `PRODUCTION`, `START_ALL_SESSIONS`, `USE_CHROME` e `ENGINE` já vêm fixados no manifest —
 não repita no env file.
