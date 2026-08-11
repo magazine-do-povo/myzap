@@ -43,6 +43,32 @@ spec:
       labels: { app: myzap }
     spec:
       serviceAccountName: myzap-api
+      # MÁQUINA DEDICADA — o MyZap não divide nó com ninguém.
+      #
+      # Cada sessão de WhatsApp aqui é um Chrome inteiro, e este serviço vaza
+      # memória com o tempo (a doc do próprio upstream manda reiniciá-lo todo
+      # dia às 3h). O dono já opera isso numa VPS isolada, e o motivo é esse:
+      # "ele bate o recurso da máquina, é perigoso, vai derrubar todos nossos
+      # projetos; ele fica criando instância com o navegador, vai inchando".
+      #
+      # Enquanto ele morava no pool compartilhado, um vazamento aqui não
+      # derrubava só ele: sob pressão de memória o kubelet despeja pod ALHEIO
+      # também, e os vizinhos eram o `ccmag-web` e os jobs da cobrança (baixa
+      # por perda, negativação no SPC, contratos do KYC).
+      #
+      # Por isso o par abaixo, e os dois são necessários:
+      #   - nodeSelector: sem ele o pod PODE voltar para o pool compartilhado
+      #     (o taint impede que outros entrem aqui, não que ele saia).
+      #   - tolerations: sem ela o pod NÃO ENTRA no nó, que tem taint
+      #     `dedicated=myzap:NoSchedule`, e fica Pending para sempre.
+      # O pool está declarado no repo infra (`myzap.tf`).
+      nodeSelector:
+        workload: myzap
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: myzap
+          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -72,30 +98,42 @@ spec:
               value: "2"
           # RESERVA IGUAL AO TETO, de propósito (QoS Guaranteed).
           #
-          # Este pod divide o nó com o `ccmag-web` e com os jobs da cobrança (baixa
-          # por perda, negativação SPC, contratos do KYC). Cada sessão do MyZap é um
-          # Chrome inteiro, e o dono já viu esse serviço comer a máquina numa VPS
-          # dedicada: "ele fica criando instância com o navegador, vai inchando, vai
-          # comendo memória". Em Burstable, o pod que INFLA é candidato a despejo —
-          # mas o kubelet despeja OUTROS pods também quando o nó aperta, e aí um
-          # vazamento aqui derrubaria a cobrança.
-          #
           # Com request == limit o pod nunca cresce além do que reservou: ao passar,
-          # o container é morto (OOMKill) e reinicia SÓ ele. O estrago fica dentro
-          # desta cela.
+          # o container é morto (OOMKill) e reinicia SÓ ele. Num nó dedicado isso
+          # deixa de ser proteção do vizinho e passa a ser o freio do vazamento —
+          # o teto é o que transforma "inchou até travar a máquina" em "reiniciou
+          # a si mesmo".
           #
-          # Medido em 11/08/2026: 763 MiB com uma sessão em QR; o nó tem 6 GiB e
-          # estava em 54%. 2 GiB cobrem as três sessões com folga e deixam o nó
-          # respirando. Se três chips pareados passarem disso, o certo NÃO é subir
-          # este número — é mover o MyZap para um pool dedicado, como o dono fez na
-          # VPS. Subir aqui é empurrar o risco para os vizinhos.
+          # A CONTA (nó e2-standard-4, exclusivo deste pod), medida em 11/08/2026
+          # com `kubectl describe node`:
+          #   alocável p/ pods ....... 3920m CPU / 13.273 MiB   (de 4 vCPU / 16 GB;
+          #                                                      o resto é kubelet
+          #                                                      + reserva do GKE)
+          #   já reservado por DaemonSet  349m CPU /   594 MiB   (fluentbit, netd,
+          #                                                      metadata, metrics,
+          #                                                      pdcsi, collector)
+          #   sobra real ............. 3571m CPU / 12.679 MiB
+          #
+          # Pedimos 3 CPU / 10 GiB. Cabe de verdade e ainda deixa ~571m e ~2,4 GiB
+          # livres — folga que existe de propósito: o pod precisa CABER de novo a
+          # cada recriação (upgrade de nó, OnDelete), e upgrade de GKE costuma
+          # trazer DaemonSet novo. Pod que não agenda é pior que pod apertado.
+          #
+          # Por que 10 GiB e não 3-4: o estudo dimensionou ~700 MiB–1 GiB por
+          # sessão, então 3 chips em regime somam ~3 GB. O que consome o resto não
+          # é o regime, é o VAZAMENTO ao longo do dia — é justamente o que faz o
+          # upstream reiniciar às 3h. Com 10 GiB o serviço aguenta o dia inteiro
+          # sem bater no teto, em vez de ser OOMKill no meio da tarde.
+          # Referência do dono, comparando com o servidor MyZap da JZTech
+          # (8 vCPU / 31 GB): "pelo menos metade disso ele precisa ter de folga" —
+          # daí o e2-standard-4, e daí dar a ele quase tudo o que o nó tem.
           resources:
             requests:
-              cpu: "1"
-              memory: "2Gi"
+              cpu: "3"
+              memory: "10Gi"
             limits:
-              cpu: "1"
-              memory: "2Gi"
+              cpu: "3"
+              memory: "10Gi"
           # /health responde sem depender de I/O de banco (o upstream tomou
           # cuidado com isso de propósito), então serve de liveness sem risco de
           # matar o pod por SQLite lento.
@@ -124,8 +162,12 @@ spec:
       volumes:
         - name: dshm
           emptyDir:
+            # Sobe de 512Mi para 1Gi junto com o teto do pod: é daqui que o
+            # Chromium tira memória compartilhada, e estourar o sizeLimit
+            # despeja o pod. Isto conta DENTRO do limite de 10 GiB acima, não
+            # além dele.
             medium: Memory
-            sizeLimit: 512Mi
+            sizeLimit: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: dados
