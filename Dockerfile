@@ -35,6 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
     && rm -rf /var/lib/apt/lists/*
 
+# sequelize-cli GLOBAL: as 19 migrations do MyZap são do formato dele, mas o CLI
+# não está no package.json — instalar aqui evita mexer no manifest do upstream (e
+# no pnpm-lock, que o build valida com --frozen-lockfile).
+RUN npm install -g sequelize-cli@6 && npm cache clean --force
+
 WORKDIR /app
 
 # O install vem antes do código para aproveitar a camada em build seguinte.
@@ -62,6 +67,7 @@ USER node
 EXPOSE 3333
 
 # tini como PID 1: o Chromium deixa processos filhos, e sem um init eles viram
-# zumbis e o pod acaba estourando o limite de PID.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# zumbis e o pod acaba estourando o limite de PID. O entrypoint aplica as
+# migrations antes de entregar o processo ao CMD.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
 CMD ["node", "index.js"]
