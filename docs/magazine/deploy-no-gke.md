@@ -31,6 +31,16 @@ kubectl -n myzap rollout status statefulset/myzap
 Com `START_ALL_SESSIONS=true` e o disco preservado, o MyZap reconecta os números sozinho ao subir —
 QR novo só é preciso se o WhatsApp tiver invalidado a sessão do lado dele.
 
+## O usuário do sistema (e a senha do painel)
+
+`Devices.user_id` é NOT NULL e os engines resolvem o usuário por `process.env.EMAIL` — sem ele,
+criar sessão falha em silêncio. O MyZap **não tem rota de cadastro** (só `/api/auth/login`), então
+o entrypoint roda `scripts/seed-usuario-sistema.js` a cada boot (idempotente).
+
+**Login do painel:** o e-mail de `EMAIL` e, como senha, **o `TOKEN` do servidor** — o
+`AuthController` compara `sha1(senha)` com a coluna e também aceita o TOKEN direto, então não
+existe uma segunda credencial para alguém perder.
+
 ## Parear um número (o único passo humano)
 
 O painel **não** está publicado na internet de propósito: quem precisa dele é uma pessoa, uma vez

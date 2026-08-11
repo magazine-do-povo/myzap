@@ -22,4 +22,9 @@ else
     echo "[entrypoint] ATENCAO: migrations falharam — subindo o app com o banco como está" >&2
 fi
 
+# Usuário do sistema: Devices.user_id é NOT NULL e os engines resolvem o usuário
+# por process.env.EMAIL. Sem ele, criar sessão falha em silêncio. Idempotente.
+echo "[entrypoint] garantindo o usuário do sistema..."
+node scripts/seed-usuario-sistema.js || echo "[entrypoint] seed do usuário falhou (segue)" >&2
+
 exec "$@"
