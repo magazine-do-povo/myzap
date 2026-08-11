@@ -70,15 +70,32 @@ spec:
               value: "true"
             - name: ENGINE
               value: "2"
+          # RESERVA IGUAL AO TETO, de propósito (QoS Guaranteed).
+          #
+          # Este pod divide o nó com o `ccmag-web` e com os jobs da cobrança (baixa
+          # por perda, negativação SPC, contratos do KYC). Cada sessão do MyZap é um
+          # Chrome inteiro, e o dono já viu esse serviço comer a máquina numa VPS
+          # dedicada: "ele fica criando instância com o navegador, vai inchando, vai
+          # comendo memória". Em Burstable, o pod que INFLA é candidato a despejo —
+          # mas o kubelet despeja OUTROS pods também quando o nó aperta, e aí um
+          # vazamento aqui derrubaria a cobrança.
+          #
+          # Com request == limit o pod nunca cresce além do que reservou: ao passar,
+          # o container é morto (OOMKill) e reinicia SÓ ele. O estrago fica dentro
+          # desta cela.
+          #
+          # Medido em 11/08/2026: 763 MiB com uma sessão em QR; o nó tem 6 GiB e
+          # estava em 54%. 2 GiB cobrem as três sessões com folga e deixam o nó
+          # respirando. Se três chips pareados passarem disso, o certo NÃO é subir
+          # este número — é mover o MyZap para um pool dedicado, como o dono fez na
+          # VPS. Subir aqui é empurrar o risco para os vizinhos.
           resources:
             requests:
-              cpu: "300m"
-              # Cada sessão é um Chrome. Este número é para UMA sessão e precisa
-              # ser remedido antes de subir a segunda e a terceira.
-              memory: "1.5Gi"
+              cpu: "1"
+              memory: "2Gi"
             limits:
-              cpu: "2"
-              memory: "3Gi"
+              cpu: "1"
+              memory: "2Gi"
           # /health responde sem depender de I/O de banco (o upstream tomou
           # cuidado com isso de propósito), então serve de liveness sem risco de
           # matar o pod por SQLite lento.
