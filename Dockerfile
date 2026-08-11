@@ -17,6 +17,11 @@ ENV NODE_ENV=production \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     CHROME_BIN=/usr/bin/chromium \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    # A que o MyZap realmente lê: engines/helper/stealth.js usa
+    # process.env.CHROME_PATH e, sem ela, `useChrome` vira false e o
+    # executablePath fica undefined — o wppconnect tenta o Chromium do puppeteer,
+    # que esta imagem não baixa. A sessão então morre calada, sem log de Chrome.
+    CHROME_PATH=/usr/bin/chromium \
     PORT=3333
 
 # chromium: o navegador do wppconnect. ffmpeg: conversão de áudio/vídeo do MyZap.
