@@ -15,7 +15,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: myzap
-  namespace: whatsapp
+  namespace: myzap
   labels: { app: myzap }
 spec:
   type: ClusterIP
@@ -29,7 +29,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: myzap
-  namespace: whatsapp
+  namespace: myzap
   labels: { app: myzap }
 spec:
   serviceName: myzap
@@ -42,7 +42,7 @@ spec:
     metadata:
       labels: { app: myzap }
     spec:
-      serviceAccountName: myzap
+      serviceAccountName: myzap-api
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

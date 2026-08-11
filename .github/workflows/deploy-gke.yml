@@ -10,7 +10,7 @@
 #
 # Por isso o StatefulSet usa `updateStrategy: OnDelete`: este workflow publica a
 # imagem e atualiza o manifest, mas o pod só troca quando alguém rodar
-# `kubectl -n whatsapp delete pod myzap-0`. Trocar de versão é uma decisão, não
+# `kubectl -n myzap delete pod myzap-0`. Trocar de versão é uma decisão, não
 # um efeito colateral de um commit.
 #
 # Variables/Secrets do repo (Settings → Secrets and variables → Actions):
@@ -34,7 +34,7 @@ env:
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
   CLUSTER: magazinedopovo-gke-prod
   ZONE: southamerica-east1-a
-  NS: whatsapp
+  NS: myzap
 
 jobs:
   build:
@@ -80,8 +80,8 @@ jobs:
 
       - name: ServiceAccount (Workload Identity)
         run: |
-          kubectl -n "$NS" create serviceaccount myzap --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n "$NS" annotate serviceaccount myzap \
+          kubectl -n "$NS" create serviceaccount myzap-api --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NS" annotate serviceaccount myzap-api \
             iam.gke.io/gcp-service-account="myzap-app-prod@${{ vars.APP_PROJECT_ID }}.iam.gserviceaccount.com" \
             --overwrite
 
@@ -102,7 +102,10 @@ jobs:
         if: ${{ inputs.reiniciar_pod }}
         run: |
           kubectl -n "$NS" delete pod myzap-0 --wait=false || true
-          kubectl -n "$NS" rollout status statefulset/myzap --timeout=600s
+          # `rollout status` NÃO funciona com updateStrategy OnDelete ("rollout
+          # status is only available for RollingUpdate strategy type") — espera-se
+          # o pod, que é o que interessa.
+          kubectl -n "$NS" wait --for=condition=Ready pod/myzap-0 --timeout=600s
 
       - name: Estado
         run: |

@@ -10,10 +10,10 @@
 |---|---|
 | Projeto GCP | `mgp-whatsapp-prod` (registry, Service Accounts, Workload Identity) |
 | Cluster | `magazinedopovo-gke-prod` (projeto compartilhado `magazinedopovo-infra`), zona `southamerica-east1-a` |
-| Namespace | `whatsapp` |
+| Namespace | `myzap` |
 | Carga | `StatefulSet/myzap`, **1 réplica**, `updateStrategy: OnDelete` |
 | Disco | PVC de 20Gi → `/app/instances` (sessões) e `/app/database` (SQLite) |
-| Serviço | `myzap.whatsapp.svc.cluster.local:3333` (ClusterIP — **não** exposto na internet) |
+| Serviço | `myzap.myzap.svc.cluster.local:3333` (ClusterIP — **não** exposto na internet) |
 | Imagem | `southamerica-east1-docker.pkg.dev/mgp-whatsapp-prod/magazinedopovo-docker-prod/myzap` |
 
 ## Deploy
@@ -24,8 +24,8 @@ não troca o pod** — marque `reiniciar_pod` só quando aceitar derrubar as ses
 Para subir uma imagem já publicada, no momento que você escolher:
 
 ```bash
-kubectl -n whatsapp delete pod myzap-0     # derruba as sessões; elas voltam pelos tokens do disco
-kubectl -n whatsapp rollout status statefulset/myzap
+kubectl -n myzap delete pod myzap-0     # derruba as sessões; elas voltam pelos tokens do disco
+kubectl -n myzap rollout status statefulset/myzap
 ```
 
 Com `START_ALL_SESSIONS=true` e o disco preservado, o MyZap reconecta os números sozinho ao subir —
@@ -37,7 +37,7 @@ O painel **não** está publicado na internet de propósito: quem precisa dele �
 por chip. Use port-forward:
 
 ```bash
-kubectl -n whatsapp port-forward statefulset/myzap 3333:3333
+kubectl -n myzap port-forward statefulset/myzap 3333:3333
 # abra http://localhost:3333 e use o TOKEN mestre (MYZAP_ENV_FILE → TOKEN)
 ```
 
@@ -61,7 +61,7 @@ O ativo é o PVC `dados-myzap-0`. Perder o disco custa **re-escanear todos os ch
 qualquer manobra que apague o volume, copie `instances/` para fora:
 
 ```bash
-kubectl -n whatsapp exec myzap-0 -- tar czf - -C /app instances > instances-$(date +%F).tgz
+kubectl -n myzap exec myzap-0 -- tar czf - -C /app instances > instances-$(date +%F).tgz
 ```
 
 ## Variáveis (MYZAP_ENV_FILE)
