@@ -96,6 +96,38 @@ spec:
               value: "true"
             - name: ENGINE
               value: "2"
+            # ─── O MECANISMO NATIVO DE RECONEXÃO. NÃO DESLIGUE. ───
+            #
+            # É ESTE job, e não o START_ALL_SESSIONS, que faz a sessão voltar sem
+            # QR depois de um restart — é o que já rodava na VPS do upstream, onde
+            # o dono diz que "reconecta mesmo se reiniciar".
+            #
+            # A diferença é o CAMINHO. O START_ALL_SESSIONS (startup.js) fabrica um
+            # `req` de mentira e chama a engine direto, por dentro do processo. O
+            # keepalive faz `POST /start` em si mesmo, por HTTP: a requisição entra
+            # pelo Express, ganha o Socket.IO e o body de verdade, e por isso passa
+            # onde o caminho de dentro tropeça.
+            #
+            # Ele veio no código desde o começo, mas sem esta variável nascia
+            # desligado — `config.session_keepalive_enabled` é
+            # `SESSION_KEEPALIVE_ENABLED === "true"`, então AUSENTE é false, e o
+            # boot logava "[SESSION KEEPALIVE] Job desabilitado nas configuracoes".
+            # Ficamos com a única rota que estava quebrada e sem a que funciona.
+            #
+            # Ele NÃO atropela ninguém (jobs/sessionKeepAlive.js:45): pula sessão
+            # sem `session`, pula quem está esperando QR (a menos que parada há mais
+            # de 10 min), respeita teto de 10 tentativas e só age em quem estava
+            # conectado ou caiu. Com os chips ainda por parear, ele roda em vazio.
+            - name: SESSION_KEEPALIVE_ENABLED
+              value: "true"
+            # 5 min: o padrão do código. Menos que isso vira tempestade de /start
+            # (cada um pode subir um Chromium, a parte caríssima deste serviço).
+            - name: SESSION_KEEPALIVE_INTERVAL_MS
+              value: "300000"
+            # Só cuida de quem estava conectado ou caiu — não fica dando start em
+            # sessão que nunca foi pareada.
+            - name: SESSION_KEEPALIVE_ONLY_CONNECTED
+              value: "true"
           # RESERVA IGUAL AO TETO, de propósito (QoS Guaranteed).
           #
           # Com request == limit o pod nunca cresce além do que reservou: ao passar,
