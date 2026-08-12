@@ -60,14 +60,31 @@ async function startAllSessions() {
     // Isso permite que todas as sessões iniciem mesmo que algumas precisem de QR code
     for (const device of devices) {
       const deviceData = device.dataValues || device;
+
+      // Device sem `session` não é sessão de ninguém: é lixo de linha órfã no
+      // banco. Tentar iniciar isso subia um Chromium para nada (a parte caríssima
+      // do MyZap) e ainda somava tentativa de start no registro errado.
+      if (!deviceData.session) {
+        customLogger.warning('[STARTUP] Ignorando device sem session (registro órfão no banco)');
+        continue;
+      }
+
       customLogger.info(`[STARTUP] Iniciando sessão: ${deviceData.session}`);
-      
+
       // Criar mock de req e res para a engine (ela espera req, res, session)
       const mockReq = {
         headers: {
           sessionkey: deviceData.sessionkey
         },
         body: {
+          // `session` NO BODY, e não só como 3º argumento: das três engines, só
+          // Venom e WhatsappWebJS aceitam `start(req, res, session)`. A WppConnect
+          // — a que está em uso (ENGINE=2) — é `start(req, res)` e lê
+          // `req.body.session`. Sem esta linha ela recebia session vazia, gravava
+          // tudo num device de session '' e nunca achava os tokens em
+          // ./instances/<session>: o restart não reconectava NINGUÉM, mesmo com o
+          // Socket.IO já contornado.
+          session: deviceData.session,
           number: deviceData.number || '',
           wh_connect: deviceData.wh_connect || '',
           wh_status: deviceData.wh_status || '',
