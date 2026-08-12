@@ -348,14 +348,21 @@ module.exports = {
           status: status || 'INITIALIZING'
         };
 
-        // Se tem QR Code no banco, incluir na resposta
-        if (data.qrCode && data.status === 'qrCode') {
-          resposta.qrCode = data.qrCode;  // Base64 da imagem do QR Code  
+        const sessionHelper = require('../../../controllers/helper/core/sessions.js');
+        const injectedClient = sessionHelper.getInjectedClient(session);
+
+        // Se tem QR Code no banco E o client que o renova está vivo na memória,
+        // devolver o QR atual. Pós-restart não há client: o QR salvo é um cadáver
+        // (o WhatsApp expira QR em ~1 min) e devolvê-lo prendia a sessão num
+        // código morto para sempre — sem client, o fluxo segue até o
+        // [QR EXPIRED]/[START NEW] logo abaixo, que regenera.
+        if (data.qrCode && data.status === 'qrCode' && injectedClient) {
+          resposta.qrCode = data.qrCode;  // Base64 da imagem do QR Code
           resposta.urlCode = data.urlCode; // Como estava antes
           resposta.state = 'QRCODE';
           resposta.status = 'qrCode';
           resposta.message = 'QR Code disponível para escaneamento';
-          
+
           customLogger.info(`[START WITH QR] ${session} - Retornando QR Code existente`);
           const http = require('../../../controllers/helper/core/http.js');
           return http.json(res, 200, resposta);
@@ -363,8 +370,6 @@ module.exports = {
 
         // RECONEXÃO CORRIGIDA - Verificar se client está REALMENTE ativo
         const currentSession = Sessions.getClient(session); // CORRIGIDO: getClient em vez de getSession
-        const sessionHelper = require('../../../controllers/helper/core/sessions.js');
-        const injectedClient = sessionHelper.getInjectedClient(session);
         const isClientActive = injectedClient && injectedClient.info;
         
         customLogger.info(`[RECONNECT CHECK] ${session} - Pasta: ${sessionExists} - Status: ${status} - Client ativo: ${!!isClientActive}`);

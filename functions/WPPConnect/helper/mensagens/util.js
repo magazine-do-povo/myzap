@@ -235,20 +235,24 @@ module.exports = {
           status: status || 'INITIALIZING'
         };
 
-        // Se tem QR Code no banco, incluir na resposta
-        if (data.qrCode && data.status === 'qrCode') {
+        // Verifica se há um client injetado na memória
+        const injectedClient = helpSS.getInjectedClient(session);
+
+        // Se tem QR Code no banco E o client que o renova está vivo na memória,
+        // devolver o QR atual. Pós-restart não há client: o QR salvo é um cadáver
+        // (o WhatsApp expira QR em ~1 min) e devolvê-lo prendia a sessão num
+        // código morto para sempre — sem client, o fluxo segue até o
+        // FORCE NEW QR regenerar (ver qrSemClient abaixo).
+        if (data.qrCode && data.status === 'qrCode' && injectedClient) {
           resposta.qrCode = data.qrCode;  // Base64 da imagem do QR Code
           resposta.urlCode = data.urlCode; // Como estava antes
           resposta.state = 'QRCODE';
           resposta.status = 'qrCode';
           resposta.message = 'QR Code disponível para escaneamento';
-          
+
           customLogger.info(`[START WITH QR] ${session} - Retornando QR Code existente`);
           return http.json(res, 200, resposta);
         }
-
-        // Verifica se há um client injetado na memória
-        const injectedClient = helpSS.getInjectedClient(session);
         let clientActive = false;
         if (injectedClient) {
           try {
@@ -305,7 +309,9 @@ module.exports = {
   // quem está trabalhando. Passado o prazo, é o contrário — é o único jeito de
   // sair do estado, e sem isso o guard acima só teria trocado "trancado para
   // sempre" por "destrancado e sem ninguém para abrir".
-  const shouldForceNew = needNewQRStatuses.includes(status) || inicioPreso;
+  // QR no banco sem client vivo para renová-lo = cadáver de restart; força novo.
+  const qrSemClient = !!data.qrCode && status === 'qrCode' && !injectedClient;
+  const shouldForceNew = needNewQRStatuses.includes(status) || inicioPreso || qrSemClient;
 
         if (shouldForceNew) {
           // Throttle simples para evitar múltiplos starts em sequência
