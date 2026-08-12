@@ -31,15 +31,29 @@ function shouldRunOnThisProcess() {
   return true;
 }
 
+/**
+ * URL para a API falar COM ELA MESMA. Sempre loopback, de propósito.
+ *
+ * Antes isto usava `HOST_SSL`/`HOST`, e no Kubernetes esses valores apontam para
+ * o Service (`http://myzap.myzap.svc.cluster.local:3333`) — o que faz a chamada
+ * sair do pod, passar pelo kube-proxy e voltar. Dois jeitos de isso falhar
+ * exatamente quando mais importa:
+ *
+ *  - NO BOOT: o `START_ALL_SESSIONS` roda dentro do callback de `server.listen`,
+ *    mas o pod só entra nos Endpoints do Service quando a readinessProbe passa
+ *    (`initialDelaySeconds: 20`). Nos primeiros segundos o Service não tem para
+ *    onde mandar, e toda reabertura de sessão falharia.
+ *  - EM CRISE: se a probe começar a falhar (pico de CPU no envio de mídia, por
+ *    exemplo), o Service tira o endpoint e o keepalive perde a capacidade de
+ *    religar sessão — justamente no momento em que ele existe para agir.
+ *
+ * Loopback não depende de DNS, de Service, de endpoint nem de readiness. O
+ * servidor é HTTP puro (`http.Server` em index.js:28) e escuta em 0.0.0.0,
+ * então 127.0.0.1 sempre chega. É também o que o `.envcopy` do projeto já
+ * sugeria (`HOST=http://127.0.0.1`).
+ */
 function resolveBaseUrl() {
-  const normalized = (config.host_ssl ?? '').trim();
-  if (normalized) {
-    return normalized.replace(/\/$/, '');
-  }
-
-  // CORRIGIDO - Usar config.host do .env ao invés de hardcoded 127.0.0.1
-  const host = process.env.HOST || 'http://127.0.0.1';
-  return `${host}:${config.port}`;
+  return `http://127.0.0.1:${config.port}`;
 }
 
 function isEligible(device) {
@@ -105,6 +119,22 @@ function isEligible(device) {
   return false;
 }
 
+/**
+ * Pede à própria API para abrir a sessão, via HTTP.
+ *
+ * Este rodeio — sair pela rede para bater em si mesmo — é o que faz a coisa
+ * funcionar, e é de propósito. Quem monta o `req` é o Express: é ele que injeta
+ * o Socket.IO (index.js:52), preenche o body, valida `apitoken`/`sessionkey`
+ * (middlewares/validations.js) e chama o método da engine pelo Router, com o
+ * receptor certo. Nada disso existe quando se chama a engine por dentro do
+ * processo com um `req` de mentira.
+ *
+ * Também é o Router que resolve QUAL engine atende (index.js:119), então quem
+ * chama aqui não precisa saber se é WppConnect, Venom ou WhatsappWebJS.
+ *
+ * Devolve true/false para quem chamou poder logar o resultado — o keepalive
+ * ignora o retorno, o boot usa.
+ */
 async function triggerStart(device, baseURL) {
   try {
     await axios.post(
@@ -120,9 +150,11 @@ async function triggerStart(device, baseURL) {
     );
 
     customLogger.debug(`[SESSION KEEPALIVE] start enviado para ${device.session}`);
+    return true;
   } catch (error) {
     const errorMessage = error?.response?.data?.error || error?.message || 'Erro desconhecido';
     customLogger.warning(`[SESSION KEEPALIVE] Falha ao iniciar ${device.session}: ${errorMessage}`);
+    return false;
   }
 }
 
@@ -204,4 +236,8 @@ function startSessionKeepAliveJob() {
 
 module.exports = {
   startSessionKeepAliveJob,
+  // Reaproveitados pelo START_ALL_SESSIONS (startup.js) para que exista UMA
+  // forma de abrir sessão no processo, e não duas com comportamentos diferentes.
+  triggerStart,
+  resolveBaseUrl,
 };

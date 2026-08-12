@@ -1,8 +1,11 @@
 "use strict";
 
-const config = require("./config");
 const SessionsHelper = require("./controllers/helper/core/sessions.js");
 const customLogger = require("./util/customLogger");
+
+// O boot reabre sessão pelo MESMO caminho do keepalive (HTTP em si mesmo).
+// Uma implementação só: se um dia mudar como se abre uma sessão, muda nos dois.
+const { triggerStart, resolveBaseUrl } = require("./jobs/sessionKeepAlive");
 
 // Imports dos jobs
 const { startCacheCleanupJob } = require("./jobs/cacheCleanup");
@@ -17,14 +20,46 @@ const { startInstanceMetricsJob } = require("./jobs/instanceMetrics");
 const { startHealthCheckJob } = require("./jobs/sessionHealthCheck");
 
 /**
- * 🚀 Inicia todas as sessões salvas no banco de dados
+ * 🚀 Reabre, no boot, as sessões salvas no banco.
+ *
+ * PEDE PELA PRÓPRIA API (HTTP), NÃO CHAMA A ENGINE POR DENTRO — e essa é a
+ * decisão inteira desta função.
+ *
+ * A versão anterior fabricava um `req`/`res` de mentira e chamava
+ * `Engine.start(...)` direto. Nunca funcionou uma vez, e cada conserto revelava
+ * a próxima peça que faltava no boneco:
+ *
+ *   1. sem `req.io` .......... Cannot read properties of undefined (reading 'emit')
+ *   2. sem `req.body.session`  a engine em uso (WppConnect) lê o nome do BODY;
+ *                             chegava vazio e gravava tudo num device de
+ *                             session '' — "📊 Sessão  - tentativa de start #3"
+ *   3. sem o receptor ....... guardar `WppConnect.start` numa variável desliga o
+ *                             método da classe; dentro dele `this` fica
+ *                             undefined (classe = strict mode) e
+ *                             `this.initSession(req, res)` (WppConnect.js:149)
+ *                             estourava
+ *                             Cannot read properties of undefined (reading 'initSession')
+ *   4. sem `res.headersSent`   o `while` que espera o QR (WppConnect.js:152)
+ *                             nunca via a resposta e girava os 12s inteiros,
+ *                             POR SESSÃO, atrasando até o agendamento dos jobs
+ *
+ * Persegui essa paridade até ficar claro que ela não tem fim: o alvo é o `req`
+ * do Express, que cresce quando alguém mexe em middleware. Então paramos de
+ * imitar e passamos a usar o original — o MESMO `POST /start` que o
+ * `sessionKeepAlive` já usava e que comprovadamente funciona. De graça vêm o
+ * Socket.IO, o body, a validação de `apitoken`/`sessionkey` e a escolha da
+ * engine pelo Router (index.js:119) — a engine deixa de ser problema desta
+ * função.
+ *
+ * Dá para chamar por HTTP aqui porque `index.js` invoca isto DENTRO do callback
+ * de `server.listen`: a porta já está aceitando conexão.
  */
 async function startAllSessions() {
   try {
     customLogger.info("[STARTUP] Buscando sessões no banco de dados...");
-    
+
     const devices = await SessionsHelper.listDevices();
-    
+
     if (!devices || devices.length === 0) {
       customLogger.info("[STARTUP] Nenhuma sessão encontrada para iniciar");
       return;
@@ -32,38 +67,16 @@ async function startAllSessions() {
 
     customLogger.info(`[STARTUP] ${devices.length} sessão(ões) encontrada(s)`);
 
-    // Importar a engine dinamicamente baseado na configuração
-    const engine = config.engine || 'WhatsappWebJS';
-    let startSessionFunction;
+    const baseURL = resolveBaseUrl();
+    customLogger.info(`[STARTUP] Reabrindo sessões via ${baseURL}/start`);
 
-    try {
-      if (engine === 'WhatsappWebJS' || engine === '1') {
-        const WhatsappWebJS = require('./engines/WhatsappWebJS');
-        startSessionFunction = WhatsappWebJS.start;
-      } else if (engine === 'WppConnect' || engine === '2') {
-        const WppConnect = require('./engines/WppConnect');
-        startSessionFunction = WppConnect.start;
-      } else if (engine === 'Venom' || engine === '3') {
-        const Venom = require('./engines/Venom');
-        startSessionFunction = Venom.start;
-      } else {
-        customLogger.warn(`[STARTUP] Engine desconhecida: ${engine}. Usando WhatsappWebJS como padrão.`);
-        const WhatsappWebJS = require('./engines/WhatsappWebJS');
-        startSessionFunction = WhatsappWebJS.start;
-      }
-    } catch (error) {
-      customLogger.error(`[STARTUP] Erro ao carregar engine ${engine}:`, error.message);
-      return;
-    }
-
-    // Iniciar cada sessão SEM BLOQUEAR (não usar await)
-    // Isso permite que todas as sessões iniciem mesmo que algumas precisem de QR code
     for (const device of devices) {
       const deviceData = device.dataValues || device;
 
       // Device sem `session` não é sessão de ninguém: é lixo de linha órfã no
-      // banco. Tentar iniciar isso subia um Chromium para nada (a parte caríssima
-      // do MyZap) e ainda somava tentativa de start no registro errado.
+      // banco (o defeito nº 2 acima criava uma). Tentar iniciar isso subia um
+      // Chromium para nada — a parte caríssima do MyZap, o motivo de ele ter uma
+      // máquina só dele — e ainda somava tentativa no registro errado.
       if (!deviceData.session) {
         customLogger.warning('[STARTUP] Ignorando device sem session (registro órfão no banco)');
         continue;
@@ -71,50 +84,21 @@ async function startAllSessions() {
 
       customLogger.info(`[STARTUP] Iniciando sessão: ${deviceData.session}`);
 
-      // Criar mock de req e res para a engine (ela espera req, res, session)
-      const mockReq = {
-        headers: {
-          sessionkey: deviceData.sessionkey
-        },
-        body: {
-          // `session` NO BODY, e não só como 3º argumento: das três engines, só
-          // Venom e WhatsappWebJS aceitam `start(req, res, session)`. A WppConnect
-          // — a que está em uso (ENGINE=2) — é `start(req, res)` e lê
-          // `req.body.session`. Sem esta linha ela recebia session vazia, gravava
-          // tudo num device de session '' e nunca achava os tokens em
-          // ./instances/<session>: o restart não reconectava NINGUÉM, mesmo com o
-          // Socket.IO já contornado.
-          session: deviceData.session,
-          number: deviceData.number || '',
-          wh_connect: deviceData.wh_connect || '',
-          wh_status: deviceData.wh_status || '',
-          wh_message: deviceData.wh_message || '',
-          wh_qrcode: deviceData.wh_qrcode || ''
-        }
-      };
-      
-      const mockRes = {
-        status: () => mockRes,
-        json: (data) => data,
-        send: (data) => data
-      };
-      
-      // Chama a função start da engine SEM AWAIT (não bloqueia)
-      // Isso permite iniciar todas as sessões em paralelo
-      startSessionFunction(mockReq, mockRes, deviceData.session)
-        .then(() => {
-          customLogger.success(`[STARTUP] ✅ Sessão ${deviceData.session} iniciada com sucesso`);
-        })
-        .catch((error) => {
-          customLogger.error(`[STARTUP] ❌ Erro ao iniciar sessão ${deviceData.session}:`, error.message);
-        });
-      
-      // Pequeno delay entre inicializações para não sobrecarregar
+      const ok = await triggerStart(deviceData, baseURL);
+      if (ok) {
+        customLogger.success(`[STARTUP] ✅ Sessão ${deviceData.session} iniciada com sucesso`);
+      } else {
+        customLogger.error(`[STARTUP] ❌ Falha ao iniciar sessão ${deviceData.session}`);
+      }
+
+      // Uma sessão de cada vez, com respiro: cada `/start` pode subir um
+      // Chromium, e três subindo juntos é justamente o pico de memória que
+      // derruba este serviço.
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
     customLogger.success("[STARTUP] Processo de inicialização de sessões disparado");
-    
+
   } catch (error) {
     customLogger.error("[STARTUP] Erro ao iniciar sessões:", error);
     throw error;

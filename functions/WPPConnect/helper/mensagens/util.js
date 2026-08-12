@@ -7,6 +7,16 @@ const config = require('../../../../config.js');
 const Device = require('../../../../Models/device.js')(config.sequelize);
 const wppHelper = require('../../../../engines/helper/wpp'); // 🆕 Para cleanBrowserCache
 
+/**
+ * Depois de quantos minutos um "estou inicializando" deixa de ser verdade.
+ *
+ * Abrir sessão leva segundos (a rota espera até 12s pelo QR). Se o banco ainda
+ * diz INITIALIZING/STARTING depois de 10 minutos, não há inicialização em
+ * andamento: há um processo que morreu no meio. O mesmo prazo que o keepalive
+ * usa para desconfiar de quem está esperando QR (jobs/sessionKeepAlive.js:69).
+ */
+const INIT_STUCK_MINUTES = 10;
+
 module.exports = {
   async getPlatformFromMessage(req, res) {
     try {
@@ -175,8 +185,32 @@ module.exports = {
         const state = data.state;
 
         // 🚨 CONTROLE DE CONCORRÊNCIA VIA BANCO 🚨
-        // Se já está inicializando, NÃO deixa entrar (evita sobrescrever)
-        if (status === 'INITIALIZING' || state === 'STARTING') {
+        // Se já está inicializando, NÃO deixa entrar (evita sobrescrever).
+        //
+        // COM PRAZO DE VALIDADE, e este detalhe já custou as sessões desta
+        // instalação. O trava-porta era eterno: bastava um processo morrer entre
+        // "marquei INITIALIZING no banco" e "a sessão abriu" para o número ficar
+        // preso PARA SEMPRE nesse estado. E preso assim, TODO caminho de
+        // recuperação passava a responder "Já inicializando. Aguarde..." sem
+        // fazer nada — o keepalive, o painel, o boot, e quem estivesse tentando
+        // gerar o QR. Cada restart reforçava a marca em vez de sair dela.
+        //
+        // Foi exatamente o que aconteceu aqui: o START_ALL_SESSIONS gravava
+        // INITIALIZING (engines/WppConnect.js:137) e estourava logo depois, no
+        // `this.initSession` (linha 149). As sessões ficaram trancadas, e a
+        // única saída era QR novo — que é presencial.
+        //
+        // Morrer no meio é cenário esperado neste serviço, não exceção: o teto de
+        // memória do container existe justamente para matá-lo quando o Chromium
+        // vaza. Um OOMKill no instante errado não pode custar um chip.
+        const iniciandoAgora = status === 'INITIALIZING' || state === 'STARTING';
+        const marcadoEm = data.updated_at || data.last_start;
+        const minutosIniciando = marcadoEm
+          ? (Date.now() - new Date(marcadoEm).getTime()) / 60000
+          : Infinity;
+        const inicioPreso = iniciandoAgora && minutosIniciando >= INIT_STUCK_MINUTES;
+
+        if (iniciandoAgora && !inicioPreso) {
           customLogger.debug(`[IDEMPOTENT] ${session} - Inicialização em andamento (status=${status}, state=${state})`);
           return http.json(res, 200, {
             result: 'success',
@@ -185,6 +219,12 @@ module.exports = {
             status: status || 'INITIALIZING',
             message: 'Já inicializando. Aguarde...'
           });
+        }
+
+        if (inicioPreso) {
+          customLogger.warning(
+            `[INIT PRESO] ${session} - banco diz ${status}/${state} há ${minutosIniciando.toFixed(1)} min; ninguém está inicializando. Reiniciando.`
+          );
         }
 
         // Monta objeto de resposta padrão
@@ -260,7 +300,12 @@ module.exports = {
           'notLogged','desconnectedMobile','browserClose','serverClose','autocloseCalled','TIMEOUT','ERROR'
         ];
 
-  const shouldForceNew = needNewQRStatuses.includes(status);
+  // `inicioPreso` entra aqui porque INITIALIZING não está (e não deve estar) na
+  // lista acima: enquanto a inicialização é real, forçar novo QR atropelaria
+  // quem está trabalhando. Passado o prazo, é o contrário — é o único jeito de
+  // sair do estado, e sem isso o guard acima só teria trocado "trancado para
+  // sempre" por "destrancado e sem ninguém para abrir".
+  const shouldForceNew = needNewQRStatuses.includes(status) || inicioPreso;
 
         if (shouldForceNew) {
           // Throttle simples para evitar múltiplos starts em sequência
