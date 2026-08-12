@@ -3,7 +3,8 @@
 # O upstream roda em VPS com pm2. Aqui o supervisor é o Kubernetes, então o
 # processo é um só (`node index.js`) e quem reinicia é o kubelet.
 #
-# O motor é wppconnect, ou seja WhatsApp WEB: precisa de um Chromium de verdade
+# O motor é WhatsApp WEB — ENGINE=1 (whatsapp-web.js), o mesmo da VPS; wppconnect
+# e venom seguem empacotados. Qualquer um precisa de um Chromium de verdade
 # dentro da imagem. Instalamos o do Debian e desligamos o download do Chromium do
 # puppeteer — baixar um segundo navegador dobraria a imagem sem uso.
 #
@@ -16,15 +17,17 @@ ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     CHROME_BIN=/usr/bin/chromium \
+    # A que o engine 1 (whatsapp-web.js) usa: o launch em engines/helper/wweb.js
+    # não fixa executablePath, então o puppeteer resolve por esta env.
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    # A que o MyZap realmente lê: engines/helper/stealth.js usa
+    # A que o wppconnect (engine 2) lê: engines/helper/stealth.js usa
     # process.env.CHROME_PATH e, sem ela, `useChrome` vira false e o
     # executablePath fica undefined — o wppconnect tenta o Chromium do puppeteer,
     # que esta imagem não baixa. A sessão então morre calada, sem log de Chrome.
     CHROME_PATH=/usr/bin/chromium \
     PORT=3333
 
-# chromium: o navegador do wppconnect. ffmpeg: conversão de áudio/vídeo do MyZap.
+# chromium: o navegador das engines (wwebjs/wppconnect). ffmpeg: conversão de áudio/vídeo do MyZap.
 # fonts-liberation + fonts-noto-color-emoji: sem fonte o WhatsApp Web renderiza
 # caixas vazias e o QR sai ilegível.
 # python3/make/g++: node-gyp, para o sqlite3 quando não houver binário pronto.

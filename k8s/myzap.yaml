@@ -94,8 +94,20 @@ spec:
               value: "true"
             - name: USE_CHROME
               value: "true"
+            # Engine 1 = whatsapp-web.js — O MESMO da VPS da JZTech que opera
+            # estável (o .env de lá crava ENGINE=1; o "wppconnect" do estudo veio
+            # do package.json, que empacota os 3 engines). E não é só paridade:
+            # sessionHealthCheck/keepalive chamam client.getState(), API que só
+            # existe no whatsapp-web.js. Com ENGINE=2 toda sessão era declarada
+            # zumbi ("client.getState is not a function") e o auto-reconnect a
+            # derrubava no meio do pareamento — QR renovando sem nunca conectar.
             - name: ENGINE
-              value: "2"
+              value: "1"
+            # A versão do WhatsApp Web fixada na VPS (engines/helper/wweb.js lê
+            # esta variável e recomenda fixar uma versão testada; ausente, a lib
+            # segue a corrente — que muda sob nossos pés).
+            - name: WHATSAPP_VERSION
+              value: "2.3001.70"
             # ─── O MECANISMO NATIVO DE RECONEXÃO. NÃO DESLIGUE. ───
             #
             # É ESTE job, e não o START_ALL_SESSIONS, que faz a sessão voltar sem
@@ -120,14 +132,16 @@ spec:
             # conectado ou caiu. Com os chips ainda por parear, ele roda em vazio.
             - name: SESSION_KEEPALIVE_ENABLED
               value: "true"
-            # 5 min: o padrão do código. Menos que isso vira tempestade de /start
-            # (cada um pode subir um Chromium, a parte caríssima deste serviço).
+            # 3 min — o valor rodando na VPS, que é a referência de estabilidade.
+            # (A "tempestade de /start" que temíamos não acontece: o job pula quem
+            # está esperando QR e respeita o teto de tentativas.)
             - name: SESSION_KEEPALIVE_INTERVAL_MS
-              value: "300000"
-            # Só cuida de quem estava conectado ou caiu — não fica dando start em
-            # sessão que nunca foi pareada.
+              value: "180000"
+            # false, como na VPS: revive QUALQUER sessão salva no volume, não só
+            # quem estava conectado na hora da queda — é o "reconecta sozinho"
+            # que conhecemos de lá.
             - name: SESSION_KEEPALIVE_ONLY_CONNECTED
-              value: "true"
+              value: "false"
           # RESERVA IGUAL AO TETO, de propósito (QoS Guaranteed).
           #
           # Com request == limit o pod nunca cresce além do que reservou: ao passar,
