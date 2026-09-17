@@ -33,7 +33,16 @@ metadata:
   labels: { app: myzap }
 spec:
   serviceName: myzap
-  replicas: 1
+  # ZERO desde 17/09/2026 — PAUSA, não desligamento. O motor subiu em agosto e ficou
+  # esperando o QR, que é presencial: em 16/09/2026 o /health dizia `sessions_total: 3,
+  # sessions_connected: 0` com 9,8 dias de uptime, num e2-standard-4 dedicado. O pool
+  # foi a `node_count = 0` no repo infra (`myzap.tf`) e a réplica desce junto para não
+  # deixar um pod Pending eterno acendendo alerta.
+  #
+  # NADA SE PERDE: o PVC `dados-myzap-0` (20 Gi) não é efêmero, e as três sessões nunca
+  # chegaram a ser pareadas. Para voltar, nesta ordem: `node_count = 1` no infra e
+  # `replicas: 1` aqui.
+  replicas: 0
   updateStrategy:
     type: OnDelete
   selector:
