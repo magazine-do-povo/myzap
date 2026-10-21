@@ -11,7 +11,7 @@ chega aos PCs das lojas.
 
 | Pasta | Domínio | O que tem |
 |---|---|---|
-| [jztech/](jztech/README.md) | operação na JZ Tech | deploy no GKE, parear número, recuperar sessão |
+| [jztech/](jztech/README.md) | operação na JZ Tech e família de cópias | deploy no GKE, parear número, recuperar sessão; a família oficial → pai → filhos e os robôs |
 
 Cada filho tem a sua pasta, que só existe nele (ex.: `docs/magazine/` no `magazine-do-povo/myzap`).
 

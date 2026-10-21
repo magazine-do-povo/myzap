@@ -11,11 +11,13 @@ o upstream, e o `README.md` da raiz continua valendo para ele.
 | Arquivo | Tipo | O que é |
 |---|---|---|
 | [deploy-no-gke.md](deploy-no-gke.md) | guia | Coordenadas no cluster, como o zap fala com o motor, deploy manual (e por que é manual), parear o chip, recuperar sessão e as variáveis que fazem o motor subir ou falhar calado. O reinício diário às 4h e como apagar sessão zumbi |
+| [familia-myzap.md](familia-myzap.md) | guia | A família oficial → pai → filhos (`billbarsch/myzap` → este repo → `magazine-do-povo/myzap`): o que roda onde, os robôs `upstream.yml` e `sync-pai.yml`, forçar a sincronização, conflito, filho novo e por que o deploy é manual. Montada em 21/10/2026 |
 
-## O essencial, em cinco linhas
+## O essencial, em seis linhas
 
 - A VPS (pm2) saiu de uso em 18/10/2026: o deploy é só o do GKE, e a VPS não recebe mais nada daqui.
 - O deploy é **manual de propósito**: trocar a imagem derruba a sessão, e o QR é presencial.
 - O `TOKEN` é **chave-mestra do servidor inteiro**, não uma senha qualquer.
 - `EMAIL` e `OPENAI_API_KEY` ausentes fazem o motor falhar **em silêncio** — leia a tabela.
 - O ativo é o PVC: perder o disco custa re-escanear todos os chips.
+- Correção nasce **aqui**, por PR; as cópias das outras empresas se atualizam sozinhas ([[familia-myzap]]).
