@@ -1,4 +1,5 @@
 const os = require('os');
+const v8 = require('v8');
 const customLogger = require('../util/customLogger');
 const emailAlertService = require('../services/emailAlertService');
 
@@ -29,17 +30,15 @@ function startMemoryMonitorJob() {
   customLogger.info(`[MEMORY MONITOR] Job agendado (${intervaloMinutos} minutos)`);
 }
 
-function reportarUsoMemoria() {
+function reportarUsoMemoria(processMemory = process.memoryUsage(), heapLimite = v8.getHeapStatistics().heap_size_limit) {
   try {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const usedMem = totalMem - freeMem;
     const usedPercent = ((usedMem / totalMem) * 100).toFixed(2);
-    
-    const processMemory = process.memoryUsage();
-    
+
     customLogger.info(`[MEMORY] Sistema: ${formatBytes(usedMem)}/${formatBytes(totalMem)} (${usedPercent}%)`);
-    customLogger.info(`[MEMORY] Processo: RSS=${formatBytes(processMemory.rss)} Heap=${formatBytes(processMemory.heapUsed)}/${formatBytes(processMemory.heapTotal)}`);
+    customLogger.info(`[MEMORY] Processo: RSS=${formatBytes(processMemory.rss)} Heap=${formatBytes(processMemory.heapUsed)}/${formatBytes(processMemory.heapTotal)} (teto ${formatBytes(heapLimite)})`);
     
     // Alertar se memória crítica
     if (usedPercent > 85) {
@@ -55,16 +54,18 @@ function reportarUsoMemoria() {
       });
     }
     
-    // Alertar se heap do processo está alto
-    const heapPercent = (processMemory.heapUsed / processMemory.heapTotal) * 100;
+    // Alertar se o heap chega perto do TETO (--max-old-space-size). Antes comparava com
+    // heapTotal, que é só o que o V8 já reservou — e ele reserva na medida do uso, então a
+    // razão vive perto de 100%: 41 e-mails de "heap crítico" sem motivo (VPS, 11/10/2026).
+    const heapPercent = (processMemory.heapUsed / heapLimite) * 100;
     if (heapPercent > 90) {
-      customLogger.warning(`⚠️ [MEMORY] Uso crítico de heap do processo: ${heapPercent.toFixed(2)}%`);
-      
+      customLogger.warning(`⚠️ [MEMORY] Uso crítico de heap do processo: ${heapPercent.toFixed(2)}% do teto de ${formatBytes(heapLimite)}`);
+
       // 📧 Enviar alerta por email
-      emailAlertService.send('HEAP_CRITICAL', { 
+      emailAlertService.send('HEAP_CRITICAL', {
         heapPercent: heapPercent,
         heapUsed: formatBytes(processMemory.heapUsed),
-        heapTotal: formatBytes(processMemory.heapTotal),
+        heapLimit: formatBytes(heapLimite),
         rss: formatBytes(processMemory.rss),
         external: formatBytes(processMemory.external),
         uptime: process.uptime()
@@ -86,4 +87,4 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-module.exports = { startMemoryMonitorJob };
+module.exports = { startMemoryMonitorJob, reportarUsoMemoria /* exposto para o teste (test/heap-alerta.js) */ };

@@ -4,15 +4,20 @@
  * Este arquivo centraliza todas as configurações do PM2 para o ambiente de produção.
  * 
  * Uso:
- *   pm2 start ecosystem.config.js
- *   pm2 delete myzap && pm2 start ecosystem.config.js
- * 
+ *   pm2 startOrReload ecosystem.config.js --env production --update-env   (o deploy faz isto)
+ *   pm2 delete myzap && pm2 start ecosystem.config.js --env production
+ *
+ * SEMPRE por este arquivo. Até 11/10/2026 a produção rodava com `pm2 start index.js`, sem
+ * ele: o kill_timeout ficava no padrão de 1,6 s e o PM2 matava o Node antes de os Chromes
+ * fecharem — a origem da sessão presa em INITIALIZING depois de todo deploy.
+ *
  * Recursos configurados:
- * - max_memory_restart: Reinicia automaticamente se usar mais de 1GB de RAM
+ * - kill_timeout: tempo para o gracefulShutdown fechar os Chromes antes do SIGKILL
+ * - max_memory_restart: rede de segurança contra vazamento real (não contra pico)
  * - node_args: Define 1GB de heap para o Node.js (com 31GB RAM disponível, é conservador)
  * - Logs organizados por tipo
  * - Variáveis de ambiente de produção
- * 
+ *
  * @author JZ-TECH
  * @date 2025-12-14
  */
@@ -28,9 +33,13 @@ module.exports = {
     // ═══════════════════════════════════════════════════════════
     // CONFIGURAÇÕES DE MEMÓRIA
     // ═══════════════════════════════════════════════════════════
-    // Reiniciar automaticamente se usar mais de 1GB de RAM
-    // Com 31GB disponíveis, isso é bem conservador e seguro
-    max_memory_restart: '1G',
+    // Reiniciar se o Node passar de 2 GB de RSS. Era 1G: o Node em produção usa ~570 MB
+    // de RSS com 4 sessões e cada mídia recebida passa pela memória em base64 — um pico
+    // acima de 1 GB é normal, e um restart por memória DERRUBA as 4 sessões de uma vez.
+    // Com o heap travado em 1 GB (node_args), passar de 2 GB só acontece com vazamento
+    // fora do heap (buffers), que é o único caso em que reiniciar resolve. Os Chromes
+    // são processos à parte e não contam aqui.
+    max_memory_restart: '2G',
     
     // Definir 1GB de heap para o Node.js
     // Isso permite que o GC trabalhe com mais espaço antes de ficar crítico
@@ -60,7 +69,17 @@ module.exports = {
     
     // Exponential backoff restart delay (mais tempo entre restarts consecutivos)
     exp_backoff_restart_delay: 100,
-    
+
+    // ═══════════════════════════════════════════════════════════
+    // ENCERRAMENTO
+    // ═══════════════════════════════════════════════════════════
+    // Quanto o PM2 espera entre o SIGINT e o SIGKILL. O gracefulShutdown do index.js
+    // leva até 8 s fechando os Chromes + 3 s fechando o servidor, com saída forçada
+    // aos 12 s. O padrão do PM2 (1,6 s) matava o Node no meio: o Chrome de cada sessão
+    // ficava órfão segurando o SingletonLock do perfil em instances/, e o próximo start
+    // caía em "browser is already running" — sessão presa em INITIALIZING após deploy.
+    kill_timeout: 20000,
+
     // ═══════════════════════════════════════════════════════════
     // CONFIGURAÇÕES DE LOG
     // ═══════════════════════════════════════════════════════════

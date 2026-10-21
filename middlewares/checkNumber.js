@@ -22,6 +22,17 @@ async function checkNumber(req, res, next) {
       });
     }
 
+    // JID inteiro ("9775882481727@lid", 23/09/2026, loja piloto da Celularis): o WhatsApp passou
+    // a entregar cliente novo como @lid, que não é telefone — o getNumberId não acha e o envio
+    // caía em 404 "não está registrado". O zap manda o JID do contato; JID não se limpa nem se
+    // verifica, vai como veio (o buildNumber também o deixa passar). Só no whatsapp-web.js (o
+    // cliente com getNumberId, como em handleNumberVerification): Venom e WPPConnect ainda
+    // acrescentam @c.us por conta própria e seguem o caminho de sempre.
+    if (ehJid(number) && typeof device.client.getNumberId === "function") {
+      await Cache.set(number, number);
+      return next();
+    }
+
     if (!isValidNumber(number)) {
       return res.status(400).send({
         error: true,
@@ -114,6 +125,11 @@ function cleanNumber(number) {
   }
   
   return cleaned;
+}
+
+/** "<dígitos>@lid", "<dígitos>@c.us" ou grupo "<dígitos[-dígitos]>@g.us": já é o destino. */
+function ehJid(number) {
+  return typeof number === "string" && /^\d+(-\d+)?@(lid|c\.us|g\.us)$/.test(number);
 }
 
 function isValidNumber(number) {
@@ -232,3 +248,4 @@ async function handleNumberVerification(client, number, res, req) {
 }
 
 exports.checkNumber = checkNumber;
+exports.ehJid = ehJid;

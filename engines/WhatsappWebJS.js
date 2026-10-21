@@ -1,5 +1,4 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const Launcher = require('chrome-launcher');
 const Sessions = require('../controllers/SessionsController.js');
 const SessionsHelper = require('../controllers/helper/core/sessions.js');
 const Events = require('../controllers/EventsController.js');
@@ -14,8 +13,6 @@ require('dotenv').config();
 
 const Device = DeviceModel(config.sequelize);
 const User = UserModel(config.sequelize);
-
-let chromeLauncher = Launcher.Launcher.getInstallations()[0];
 
 module.exports = class WhatsappWebJS {
   static async start(req, res, session) {
@@ -34,14 +31,21 @@ module.exports = class WhatsappWebJS {
         return resolve({ status: 'INITIALIZING', session });
       }
 
-      // Se já há um client vivo e CONNECTED na memória, não recria (evita 2º Chrome).
+      // Já há um client na memória com o Chrome VIVO: não recria, qualquer que seja o
+      // estado do momento. Antes só o CONNECTED segurava — e bastava o WhatsApp oscilar
+      // (getState ≠ CONNECTED por um instante) para o keepalive subir um 2º Client no
+      // MESMO perfil: o Chrome reaproveita o navegador aberto, abre OUTRA aba do
+      // WhatsApp Web e a primeira vira "O WhatsApp está aberto em outra janela" —
+      // conectada e SURDA (Sonhare, 26/09: 1 h sem receber nada). Sessão que cai de
+      // verdade passa pelo 'disconnected', que destrói o client e fecha o Chrome.
       try {
         const existing = SessionsHelper.getInjectedClient(session);
         if (existing && typeof existing.getState === 'function') {
           const st = await existing.getState().catch(() => null);
-          if (st === 'CONNECTED') {
-            customLogger.info(`${session} - ✅ Já conectado, start duplicado ignorado`);
-            return resolve({ status: 'CONNECTED', session });
+          const chromeVivo = Boolean(existing.pupBrowser && existing.pupBrowser.isConnected && existing.pupBrowser.isConnected());
+          if (st === 'CONNECTED' || chromeVivo) {
+            customLogger.info(`${session} - ✅ Cliente vivo (${st || 'sem estado'}), start duplicado ignorado`);
+            return resolve({ status: st === 'CONNECTED' ? 'CONNECTED' : 'INITIALIZING', session });
           }
         }
       } catch (_) { /* segue para criar */ }
@@ -63,17 +67,26 @@ module.exports = class WhatsappWebJS {
         const number = req?.body?.number || '';
         const body = req?.body || [];
 
-        const wh_connect = req?.body?.wh_connect || '';
-        const wh_status = req?.body?.wh_status || '';
-        const wh_message = req?.body?.wh_message || '';
-        const wh_qrcode = req?.body?.wh_qrcode || '';
+        // O upsert abaixo GRAVA os wh_*, e nem todo /start os manda (keepalive, painel; o
+        // reconectar do zap até 06/10/2026). Sem eles valem os que já estão gravados: senão a
+        // sessão volta conectada e SURDA, sem mandar nada para quem a usa.
+        const anterior = await Device.findOne({ where: { session } }).catch(() => null);
+        const webhook = (campo) => req?.body?.[campo] || anterior?.[campo] || '';
+        const wh_connect = webhook('wh_connect');
+        const wh_status = webhook('wh_status');
+        const wh_message = webhook('wh_message');
+        const wh_qrcode = webhook('wh_qrcode');
 
         customLogger.whatsapp(`🚀 Starting WhatsApp WebJS - Session: ${session}`);
 
         try {
           // ✅ ADICIONADO - Criar device igual WPPConnect
           const { empresa_nome, api_url } = body;
-          const sysUser = await User.findOne({ where: { email: process.env.EMAIL } });
+          // findOrCreate: banco novo (semente por migrations) não traz o
+          // usuário do sistema — sem ele o upsert abaixo morria em
+          // user_id NOT NULL e o QR nunca nascia.
+          const { getOrCreateSystemUser } = require('../controllers/helper/core/systemUser.js');
+          const sysUser = await getOrCreateSystemUser();
           
           const devicePayload = {
             user_id: sysUser?.id,
@@ -148,6 +161,16 @@ module.exports = class WhatsappWebJS {
           clientId: '', // ✅ Deixar vazio para evitar prefixo
           dataPath: path.join('./instances', session) // ✅ Pasta direta com nome da sessão
         });
+
+        // Sem isto o Chrome restaura a aba do WhatsApp da vez anterior (o pm2 mata o
+        // Chrome e o perfil fica "Crashed"): duas abas, "aberto em outra janela", surda.
+        try {
+          if (require('./helper/perfilChrome.js').limparRestauracaoDeAbas(require('path').join('./instances', session, 'session'))) {
+            customLogger.info(`${session} - 🧹 Abas da vez anterior descartadas (sem 2ª aba do WhatsApp)`);
+          }
+        } catch (e) {
+          customLogger.warning(`${session} - não limpou a restauração de abas: ${e.message}`);
+        }
 
         client = new Client(clientOptions);
 
@@ -319,10 +342,14 @@ module.exports = class WhatsappWebJS {
           global.__wwebInit = global.__wwebInit || {};
           global.__wwebInit[session] = Date.now();
 
-          // Atualiza o banco; o sessionKeepAlive reconecta a partir daqui.
+          // Atualiza o banco; o sessionKeepAlive reconecta a partir daqui — menos quem só volta
+          // com QR novo: LOGOUT (tiraram o aparelho no celular, ou o WhatsApp derrubou) e QR que
+          // ninguém leu. Esses ficam `notLogged` ("aguardando QR"), e o keepalive não sobe Chrome
+          // para mostrar QR a ninguém (Valparaíso e Guarulhos, LOGOUT em 30/09/2026).
+          const precisaQr = ['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 'Max qrcode retries reached'].includes(String(reason));
           Device.update({
             state: 'DISCONNECTED',
-            status: 'disconnected',
+            status: precisaQr ? 'notLogged' : 'disconnected',
             updated_at: new Date(),
             last_disconnect: new Date()
           }, { where: { session, sessionkey } }).catch(err => {
@@ -387,6 +414,11 @@ module.exports = class WhatsappWebJS {
         });
 
         Events.receiveMessage(session, client, req);
+        // O vigia de surdez (jobs/sessionHealthCheck) compara isto com o que o
+        // WhatsApp Web da sessão recebeu: a hora da última mensagem que CHEGOU aqui.
+        client.on('message', (m) => {
+          if (!m.fromMe) require('../jobs/sessionHealthCheck.js').registerMessageReceived(session);
+        });
         Events.statusMessage(session, client, req);
 
         client.on('change_battery', (batteryInfo) => {

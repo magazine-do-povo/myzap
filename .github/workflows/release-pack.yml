@@ -1,0 +1,76 @@
+name: Release Runtime Pack
+
+# CANAL DE RELEASE DO MOTOR (v3): em TAG v* (gate humano — nunca push na
+# main), monta o Runtime Pack win32-x64 pronto para rodar (codigo dieta
+# ENGINE=1 + node_modules --prod hoisted + Chromium + Node embutido + semente
+# do banco gerada pelas migrations) e publica como release. O gerenciadorMyzap
+# consulta o manifest deste canal (releases/latest/download/...) e troca o
+# motor de forma atomica com rollback — sem pnpm, sem compilacao e sem git na
+# maquina do cliente.
+#
+# Para lancar: bump da version no package.json -> commit -> git tag vX.Y.Z ->
+# git push --tags. (workflow_dispatch existe para teste do proprio workflow;
+# nesse modo o pack NAO vira release, so artifact.)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Gate: o pack da tag chega em TODA a frota (releases/latest, ciclo 6h) e
+  # nada obriga a tag a ter passado pela main — um pack quebrado custa um
+  # ciclo inteiro de frota pra corrigir, o smoke custa segundos. Roda o
+  # decisionEngine real de ponta a ponta com IA_PROVIDER=agente (Node puro).
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Smoke IA (bloqueia pack quebrado)
+        run: node test/smoke-ia.js
+
+  build-pack:
+    needs: smoke
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # O Node daqui e o Node EMBUTIDO no pack (o builder baixa o mesmo
+      # binario) e o ABI contra o qual o prebuild do sqlite3 e resolvido.
+      # Trocar a major aqui = trocar a major do runtime dos clientes.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Runtime Pack
+        run: node scripts/build-pack.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact (sempre)
+        uses: actions/upload-artifact@v4
+        with:
+          name: myzap-pack-win32-x64
+          path: |
+            dist-pack/myzap-pack-win32-x64.zip
+            dist-pack/myzap-pack-win32-x64.manifest.json
+
+      - name: Release (somente em tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          files: |
+            dist-pack/myzap-pack-win32-x64.zip
+            dist-pack/myzap-pack-win32-x64.manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,101 @@
+# Reinício diário do MyZap — por quê e como.
+#
+# Cada sessão é um Chrome inteiro e o serviço vaza memória ao longo do dia (a doc
+# do upstream manda reiniciar de madrugada). Medido em 27/09–03/10/2026: o myzap-0
+# foi de 1,0 para 5,0 GB e de 0,25 para 1,6 core com as MESMAS sessões. Sem isto,
+# bate o limite de 10 GiB em ~5 dias e cai sozinho (OOMKill) em horário aleatório.
+#
+# O reinício é seguro porque a sessão vive no disco (PVC): o pod volta e reconecta
+# os números pelos tokens, sem QR. Sessão zumbi (desconectada/esperando QR) também
+# volta — zumbi se apaga pela API (deleteSession), não com reinício.
+#
+# Um pod por vez: apaga, espera o pod NOVO ficar Ready (uid diferente — o antigo
+# ainda responde Ready enquanto termina) e dá 2 min para as sessões reconectarem
+# antes de ir ao próximo. Se o primeiro não voltar em 10 min, para e não derruba o
+# segundo. Fala direto com a API do cluster via curl (imagem já usada nos outros
+# CronJobs da frota) — sem kubectl, sem imagem nova. `pretty=false` porque a API
+# devolve JSON com quebras de linha para o curl, e o grep espera JSON compacto.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: myzap-reinicio
+  namespace: myzap
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: myzap-reinicio
+  namespace: myzap
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: myzap-reinicio
+  namespace: myzap
+subjects:
+  - kind: ServiceAccount
+    name: myzap-reinicio
+    namespace: myzap
+roleRef:
+  kind: Role
+  name: myzap-reinicio
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: myzap-reinicio-diario
+  namespace: myzap
+spec:
+  schedule: "0 4 * * *"
+  # Suspenso desde 19/10/2026 junto com a reserva fria (myzap.yaml, replicas: 0). Volta junto.
+  suspend: true
+  timeZone: America/Sao_Paulo
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          serviceAccountName: myzap-reinicio
+          restartPolicy: Never
+          containers:
+            - name: reinicio
+              image: curlimages/curl:8.5.0
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 100m, memory: 64Mi }
+              env:
+                - name: PODS
+                  value: "myzap-0" # uma réplica desde 18/10/2026 (reserva); com a segunda de volta, "myzap-0 myzap-1"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  API=https://kubernetes.default.svc/api/v1/namespaces/myzap/pods
+                  SA=/var/run/secrets/kubernetes.io/serviceaccount
+                  k() { curl -sS --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" "$@"; }
+                  uid() { k "$API/$1?pretty=false" | grep -o '"uid":"[^"]*"' | head -1; }
+                  pronto() { k "$API/$1?pretty=false" | grep -q '"type":"Ready"[^}]*"status":"True"'; }
+                  for POD in $PODS; do
+                    ANTES=$(uid "$POD")
+                    echo "$(date -u +%FT%TZ) apagando $POD ($ANTES)"
+                    k -X DELETE "$API/$POD" -o /dev/null
+                    i=0
+                    until [ "$(uid "$POD")" != "$ANTES" ] && pronto "$POD"; do
+                      i=$((i+1))
+                      if [ $i -gt 60 ]; then echo "$POD nao voltou em 10 min; parando para nao derrubar o outro"; exit 1; fi
+                      sleep 10
+                    done
+                    echo "$(date -u +%FT%TZ) $POD novo e Ready; 2 min para as sessoes reconectarem"
+                    sleep 120
+                  done
+                  echo "$(date -u +%FT%TZ) reinicio concluido"

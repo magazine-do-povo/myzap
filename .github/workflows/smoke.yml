@@ -1,0 +1,39 @@
+# Smoke do fluxo IA a cada push: decisionEngine real de ponta a ponta com
+# IA_PROVIDER=agente (agente = HTTP fake local). Sem pnpm install — o smoke
+# roda com Node puro. Teria pego o TypeError do "function process" que passou
+# por duas releases (v3.0.3/v3.0.4).
+name: Smoke IA
+
+on:
+  push:
+    branches: [main]
+    paths: ['index.js', 'startup.js', 'config.js', 'routers/**', 'controllers/**', 'engines/**', 'util/**', 'test/**', 'package.json']
+  pull_request:
+    paths: ['index.js', 'startup.js', 'config.js', 'routers/**', 'controllers/**', 'engines/**', 'util/**', 'test/**', 'package.json']
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node test/smoke-ia.js
+
+  # Regressão do boot (incidente de frota 01/09): porta em <5s prova que o
+  # listen-early continua antes dos requires pesados; health completo em
+  # <120s prova que o carregarNucleo() sobe sem virar zumbi "starting".
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1"
+      - run: node test/boot-test.js

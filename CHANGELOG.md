@@ -4,6 +4,90 @@ Todas as mudanças notáveis neste fork serão documentadas neste arquivo.
 
 ---
 
+## [3.0.23] - 2026-10-19
+
+### 🛠️ Loja fechada recebe o aviso de fechada, não a mensagem padrão com o link
+
+Regra do dono: com a loja fechada (chave "Está aberto?" desligada ou fora do
+expediente, quem decide é a API do ClickExpress), a mensagem padrão de "faça seu
+pedido" levava o cliente a um site fechado. Agora sai "No momento estamos fechados
+e não estamos atendendo. Assim que abrirmos, é só mandar uma mensagem por aqui",
+uma vez por dia por número, e a padrão não conta como enviada: a primeira mensagem
+com a loja aberta ainda leva o link e os anexos. Sem resposta da API, a padrão de
+sempre sai, nunca o aviso.
+
+Versão de correção em cima da v3.0.22: leva só isto para a frota (a `main` tem
+outras mudanças que ainda não foram liberadas para as máquinas de lojista).
+
+Teste: `node test/anexos-padrao.js` — reprova sem o conserto.
+
+## [3.0.22] - 2026-09-19
+
+### 🛠️ O marcador de mídia finalmente chega ao agente
+
+A v3.0.21 traduziu imagem/vídeo/figurinha em `[imagem]`/`[vídeo]`/`[figurinha]`,
+mas o `EventsController` montava o texto da IA com `message.body` cru e jogava o
+marcador fora — o conserto nunca valeu em campo. Foto SEM legenda chegava vazia
+ao agente, que respondia `mensagem_vazia`, ou seja, silêncio: em 17/09 um cliente
+do Capucho mandou dois comprovantes em foto, não recebeu nada e o pedido de R$ 45
+foi digitado à mão pela loja. Foto COM thumbnail chegava como 3,4 KB de base64 no
+lugar da fala do cliente. Em 30 dias de produção: zero turnos com `[imagem]` e 17
+com base64.
+
+Agora o texto que segue para a IA sai de `textoDaMensagem()`, recalculado depois
+do passo de áudio (que pode trocar a mensagem pela versão transcrita). PDF
+continua chegando pelo nome do arquivo.
+
+Teste: `node test/midia-para-agente.js` — percorre o EventsController real com as
+bordas stubadas e reprova sem o conserto. Entrou no `pnpm test`.
+
+## [3.0.21] - 2026-09-09
+
+### 🛠️ Imagem, vídeo e figurinha não chegam mais ao agente como base64
+
+No whatsapp-web.js o `body` de uma mensagem de mídia é o thumbnail em base64.
+Em 08/09 um cliente do Capucho mandou uma foto e o agente recebeu 3,4 KB de
+`/9j/4AAQ...` como se fosse texto do cliente (gastou token e não entendeu nada).
+Agora `textoDaMensagem()` entrega a legenda ou um marcador — `[imagem]`,
+`[vídeo]`, `[figurinha]` — e o agente sabe o que fazer (comprovante em imagem
+vira chamado para a equipe). Documento continua com o nome do arquivo.
+Teste: `PORT=1 node test/midia-marcador.js`.
+
+## [3.0.20] - 2026-09-06
+
+### 🛠️ Loja assumiu a conversa: a IA agora pausa de verdade
+
+- Mensagem enviada pela loja (fromMe) era gravada no histórico do número da
+  PRÓPRIA loja (`message.from`), então a pausa "atendente humano falou" nunca
+  disparava para o cliente e o bot seguia respondendo em cima do atendente.
+  `contextBuilder` passa a usar o destinatário quando a mensagem é fromMe.
+- Texto/caption que sai pela API (confirmação de pedido, NF-e, teste do painel)
+  é marcado como saída do sistema (`registerIAResponse`) antes de enviar, e
+  `processFromMe` ignora eco do bot e saída do sistema — só o atendente de
+  verdade registra e pausa. O texto do atendente vai ao agente só como contexto.
+- Bloqueio por humano na conversa (`agente_recente`/`aguardando_humano`) não
+  manda mais a mensagem padrão.
+- `HUMAN_PAUSE_MINUTES` padrão 120 → 30 (igual ao agente), renovado a cada
+  mensagem do atendente.
+- Áudio, foto ou figurinha que a loja manda pelo celular também conta como
+  "atendente na conversa" (caso real: o Vaqueiro respondeu por áudio e o bot
+  seguiu falando por cima). A voz do bot, os anexos da mensagem padrão e a mídia
+  enviada pela API são marcados como saída do sistema por destino (2 min).
+- `test/loja-assumiu.js` cobre tudo isso; `npm test` roda os três testes.
+
+## [3.0.19] - 2026-09-06
+
+### ✨ Anexos na mensagem padrão
+
+- A mensagem padrão do primeiro contato pode vir acompanhada de fotos ou PDF
+  (cardápio, promoção) configurados no painel do ClickExpress. O myzap busca a
+  lista em `GET /myzap/anexos-padrao/{sessionkey}` na hora de mandar (cache de
+  60 s) e só envia com a loja aberta — a API é quem decide "aberto".
+- `messageSender.sendFileFromUrl`: imagem vai como foto, PDF como documento
+  (webjs, wppconnect e venom).
+- Um anexo que falhar não segura os outros nem o texto.
+- `npm test` roda o smoke da IA e o teste dos anexos (`test/anexos-padrao.js`).
+
 ## [2.0.0] - 2025-11-16
 
 ### 🎉 Fork Inicial - JZ-TECH-SYS

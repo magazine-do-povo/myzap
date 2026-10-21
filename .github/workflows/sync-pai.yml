@@ -1,0 +1,179 @@
+name: Sincronizar com o pai (JZ-TECH-SYS/myzap)
+
+# Faz a cópia de cada empresa se atualizar sozinha a partir do pai. A família
+# (docs/jztech/familia-myzap.md): oficial billbarsch/myzap → PAI JZ-TECH-SYS/myzap (recebe o oficial
+# por PR revisado, upstream.yml) → FILHOS, as cópias das outras orgs (em 21/10/2026, só
+# magazine-do-povo/myzap). Roda SÓ nos filhos (o `if` do job); no pai o arquivo existe só para chegar
+# aos filhos pela própria sincronização.
+#
+# Todo dia às 03:47 de Brasília (o GitHub atrasa horas), ou na hora: gh workflow run sync-pai.yml -R <org>/<repo>
+# 1. Busca a main do pai por https, SEM chave nem secret: o pai é público. Se a main do filho já
+#    contém a do pai: "em dia com o pai" e sai.
+# 2. Faz o merge do pai no branch sync/pai-<sha>. Conflito: abre/atualiza a issue com label
+#    sync-pai marcando o @joaosn, com os arquivos em conflito, e para sem empurrar nada.
+# 3. Se o merge muda arquivos de .github/workflows/, também para com issue: o GITHUB_TOKEN não pode
+#    gravar workflow (regra do GitHub: vale o diff do push). Essa vez é à mão.
+# 4. Sem conflito: build/teste offline (pnpm install, node --check, os testes do package.json e o
+#    boot, SEM REDE), empurra o branch, abre o PR e mescla na main (merge commit) com o próprio
+#    GITHUB_TOKEN. Quando volta a dar certo, fecha a issue.
+#
+# Push e merge feitos com o GITHUB_TOKEN NÃO disparam outros workflows (smoke.yml, deploy-gke.yml).
+# É o desejado: o deploy de cada empresa continua MANUAL, porque trocar a imagem derruba as sessões
+# de WhatsApp e o QR é presencial. Quem escolhe a hora é gente, não o robô.
+on:
+  schedule:
+    - cron: "47 6 * * *"   # 03:47 em Brasília (UTC-3, sem horário de verão)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-pai
+  cancel-in-progress: false
+
+jobs:
+  sincronizar:
+    if: github.repository != 'JZ-TECH-SYS/myzap'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # empurrar o branch sync/pai-<sha> e mesclar o PR
+      pull-requests: write   # abrir o PR
+      issues: write          # issue sync-pai quando a sincronização trava
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}   # o filho pode ser fork do pai: PR e issue ficam AQUI
+      PAI: JZ-TECH-SYS/myzap
+      DOC: https://github.com/JZ-TECH-SYS/myzap/blob/main/docs/jztech/familia-myzap.md
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Buscar o pai e fazer o merge
+        id: pai
+        run: |
+          set -euo pipefail
+          # o pai é público: busca anônima, sem o token deste repositório
+          git -c http.https://github.com/.extraheader= fetch -q --no-tags "https://github.com/$PAI.git" +refs/heads/main:refs/remotes/pai/main
+          sha=$(git rev-parse pai/main)
+          curto=${sha:0:7}
+          printf 'sha=%s\ncurto=%s\n' "$sha" "$curto" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor pai/main origin/main; then
+            echo estado=em-dia >> "$GITHUB_OUTPUT"
+            echo "em dia com o pai ($curto)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          conflito() {
+            { echo estado=conflito; echo 'arquivos<<FIM'; git diff --name-only --diff-filter=U; echo FIM; } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 0
+          }
+          ramo=sync/pai-$curto
+          echo "ramo=$ramo" >> "$GITHUB_OUTPUT"
+          base=origin/main
+          if git rev-parse -q --verify "origin/$ramo" >/dev/null; then base="origin/$ramo"; fi   # um run anterior já empurrou: continua dele
+          git switch -q -C "$ramo" "$base"
+          git merge -q --no-edit origin/main || conflito   # nada a fazer quando o branch é novo
+          git merge -q --no-ff --no-edit -m "chore(sync): sincroniza com o pai $PAI ($curto)" pai/main || conflito
+          wf=$(git diff --name-only origin/main HEAD -- .github/workflows)
+          if [ -n "$wf" ]; then
+            { echo estado=workflow; echo 'arquivos<<FIM'; echo "$wf"; echo FIM; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo estado=merge >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.pai.outputs.estado == 'merge'
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        if: steps.pai.outputs.estado == 'merge'
+
+      - name: Build e testes (offline, sem rede)
+        if: steps.pai.outputs.estado == 'merge'
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1"
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          git ls-files -z '*.js' ':!:public/libs/**' | xargs -0 -n1 node --check
+          # Os testes rodam num namespace SEM REDE (só loopback): nada chega a IA, WhatsApp ou API de
+          # verdade, nem um teste novo escrito errado, e o runner não tem chave nenhuma. O Ubuntu 24.04
+          # barra namespace sem root pelo AppArmor; sem ele o unshare falha e o passo fica vermelho.
+          sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn sh -ec 'ip link set lo up; pnpm test; node test/boot-test.js'
+
+      - name: Empurrar, abrir o PR e mesclar
+        id: pr
+        if: steps.pai.outputs.estado == 'merge'
+        env:
+          RAMO: ${{ steps.pai.outputs.ramo }}
+          SHA: ${{ steps.pai.outputs.sha }}
+          CURTO: ${{ steps.pai.outputs.curto }}
+        run: |
+          set -euo pipefail
+          git push -q origin "$RAMO"
+          pr=$(gh pr list --head "$RAMO" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            commits=$(git log --no-merges --max-count=40 --format='- %as `%h` %s' origin/main..pai/main)
+            corpo=$(printf 'Sincronização automática com o pai [`%s`](https://github.com/%s/commit/%s) (workflow `sync-pai.yml`, [run](%s)).\n\nBuild e testes passaram (pnpm install, node --check, testes do package.json e boot, sem rede). O robô mescla sozinho; o deploy desta empresa continua manual: [familia-myzap.md](%s).\n\nO que chega do pai:\n\n%s\n' "$CURTO" "$PAI" "$SHA" "$RUN" "$DOC" "$commits")
+            url=$(gh pr create --base main --head "$RAMO" --title "chore(sync): sincroniza com o pai ($CURTO)" --body "$corpo")
+            pr=${url##*/}
+          fi
+          # o GitHub calcula se o PR é mesclável logo depois de criado: algumas tentativas curtas
+          for _ in 1 2 3 4 5 6; do gh pr merge "$pr" --merge && break; sleep 10; done
+          if [ "$(gh pr view "$pr" --json state --jq .state)" != MERGED ]; then echo "::error::não consegui mesclar o PR #$pr"; exit 1; fi
+          git push -q origin --delete "$RAMO" || true
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "sincronizado com o pai ($CURTO): PR #$pr mesclado" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Issue sync-pai (abre quando trava, fecha quando volta)
+        if: always()
+        env:
+          BUSCA: ${{ steps.pai.outcome }}
+          ESTADO: ${{ steps.pai.outputs.estado }}
+          ARQUIVOS: ${{ steps.pai.outputs.arquivos }}
+          SHA: ${{ steps.pai.outputs.sha }}
+          CURTO: ${{ steps.pai.outputs.curto }}
+          PR: ${{ steps.pr.outputs.pr }}
+          JOB: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          arquivos=$(printf '%s\n' "$ARQUIVOS" | sed '/^$/d; s/^/- `/; s/$/`/')
+          if [ "$BUSCA" = failure ]; then
+            motivo=acesso
+            texto="Não consegui buscar a main do pai \`$PAI\` (público, por https e sem chave). O pai foi renomeado, apagado ou virou privado? Veja o log do run."
+          elif [ "$ESTADO" = conflito ]; then
+            motivo=conflito
+            texto=$(printf 'O merge do pai (`%s`) deu **conflito** em:\n\n%s\n\nNada foi empurrado. Resolva à mão (seção "Conflito" do guia).' "$CURTO" "$arquivos")
+          elif [ "$ESTADO" = workflow ]; then
+            motivo=workflow
+            texto=$(printf 'O pai (`%s`) mudou **workflows**:\n\n%s\n\nO GITHUB_TOKEN não pode gravar em `.github/workflows/` (regra do GitHub), então esta sincronização é à mão (seção "Sincronizar à mão" do guia).' "$CURTO" "$arquivos")
+          elif [ "$ESTADO" = merge ] && [ "$JOB" != success ]; then
+            motivo=falha
+            texto="O merge do pai (\`$CURTO\`) não deu conflito, mas o build/teste, o push ou o PR falhou. Veja o log do run. Se ele disser \"not permitted to create or approve pull requests\", o Actions não pode abrir PR aqui (seção \"Permissões\" do guia)."
+          else
+            num=$(gh issue list --label sync-pai --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$num" ]; then gh issue close "$num" --comment "Resolvido: em dia com o pai (\`$CURTO\`)${PR:+, PR #$PR}."; fi
+            exit 0
+          fi
+          marca="<!-- sync-pai: $SHA $motivo -->"
+          corpo=$(printf '%s\n\n%s\n\n[Run](%s) · como resolver: [familia-myzap.md](%s)\n' "$marca" "$texto" "$RUN" "$DOC")
+          gh label create sync-pai --color d93f0b --description "Sincronização com o pai $PAI" --force >/dev/null
+          num=$(gh issue list --label sync-pai --state open --json number --jq '.[0].number // empty')
+          if [ -z "$num" ]; then
+            gh issue create --title "Sincronização com o pai travada" --label sync-pai --assignee joaosn --body "@joaosn $corpo"
+          elif gh issue view "$num" --json body --jq .body | grep -qF "$marca"; then
+            echo "::warning::já relatado na issue #$num"
+            exit 0
+          else
+            gh issue comment "$num" --body "@joaosn $texto ([run]($RUN))"
+            gh issue edit "$num" --body "$corpo"
+          fi
+          exit 1

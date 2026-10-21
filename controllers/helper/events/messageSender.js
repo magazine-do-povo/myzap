@@ -3,6 +3,7 @@
  * compatível com: WPPConnect, Venom, whatsapp-web.js.
  */
 const customLogger = require('../../../util/customLogger');
+const { registerSystemMedia } = require('../ia/iaResponseCache');
 
 async function detectEngine(client) {
   if (!client || typeof client !== 'object') return 'desconhecido';
@@ -99,16 +100,27 @@ async function sendText({ client, to, text }) {
   }
 }
 
+// webjs: chatstate DIRETO na página (window.WWebJS.sendChatstate), sem passar
+// pelo getChatById — o lookup do Chat quebra a cada atualização do WhatsApp
+// Web ("Evaluation failed: r", 31/08) e o cliente ficava sem o "digitando...".
+// É exatamente o que Chat.sendStateTyping faz por dentro, menos o lookup.
+async function chatstateWebjs(client, to, estado) {
+  if (!client?.pupPage) return;
+  await client.pupPage.evaluate(
+    (state, chatId) => window.WWebJS?.sendChatstate?.(state, chatId),
+    estado,
+    to
+  );
+}
+
 async function startTyping({ client, to }) {
   if (!client || !to) return;
   const engine = await detectEngine(client);
   try {
     switch (engine) {
-      case 'webjs': {
-        if (!client.getChatById) return; // silencioso
-        const chat = await client.getChatById(to);
-        if (chat && chat.sendStateTyping) await chat.sendStateTyping();
-        break; }
+      case 'webjs':
+        await chatstateWebjs(client, to, 'typing');
+        break;
       case 'wppconnect':
       case 'venom':
         if (typeof client.startTyping === 'function') {
@@ -120,7 +132,19 @@ async function startTyping({ client, to }) {
         break;
     }
   } catch (err) {
-    customLogger.warning(`[MessageSender] Erro startTyping (${engine}): ${err.message}`);
+    customLogger.warning(`[MessageSender] Erro startTyping (${engine}): ${err.message} ${(err.stack || '').split('\n')[1]?.trim() || ''}`);
+  }
+}
+
+/** "gravando áudio..." — usado quando a resposta ao cliente vem em voz (TTS) */
+async function startRecording({ client, to }) {
+  if (!client || !to) return;
+  const engine = await detectEngine(client);
+  try {
+    if (engine === 'webjs') await chatstateWebjs(client, to, 'recording');
+    else if (typeof client.startRecording === 'function') await client.startRecording(to);
+  } catch (err) {
+    customLogger.warning(`[MessageSender] Erro startRecording (${engine}): ${err.message}`);
   }
 }
 
@@ -129,11 +153,9 @@ async function stopTyping({ client, to }) {
   const engine = await detectEngine(client);
   try {
     switch (engine) {
-      case 'webjs': {
-        if (!client.getChatById) return; // silencioso
-        const chat = await client.getChatById(to);
-        if (chat && chat.sendStatePaused) await chat.sendStatePaused();
-        break; }
+      case 'webjs':
+        await chatstateWebjs(client, to, 'stop');
+        break;
       case 'wppconnect':
       case 'venom':
         if (typeof client.stopTyping === 'function') {
@@ -144,8 +166,92 @@ async function stopTyping({ client, to }) {
         break; // no-op
     }
   } catch (err) {
-    customLogger.warning(`[MessageSender] Erro stopTyping (${engine}): ${err.message}`);
+    customLogger.warning(`[MessageSender] Erro stopTyping (${engine}): ${err.message} ${(err.stack || '').split('\n')[1]?.trim() || ''}`);
   }
 }
 
-module.exports = { sendText, startTyping, stopTyping, detectEngine, verifyNumber };
+/**
+ * Envia áudio como mensagem de voz (PTT). Usado pela resposta em áudio do
+ * Atendente IA (cliente mandou áudio -> agente devolve TTS em ogg/opus).
+ * Falhou? O chamador cai para sendText — nunca deixar o cliente sem resposta.
+ */
+async function sendPtt({ client, to, base64, mimetype, session }) {
+  if (!client || !to || !base64) return false;
+  registerSystemMedia(session, to);
+  const engine = await detectEngine(client);
+  try {
+    switch (engine) {
+      case 'webjs': {
+        const { MessageMedia } = require('whatsapp-web.js');
+        const media = new MessageMedia(mimetype || 'audio/ogg; codecs=opus', base64, 'resposta.ogg');
+        await client.sendMessage(to, media, { sendAudioAsVoice: true, sendSeen: false });
+        break; }
+      case 'wppconnect':
+      case 'venom':
+        if (typeof client.sendPttFromBase64 === 'function') {
+          await client.sendPttFromBase64(to, `data:audio/ogg;base64,${base64}`, 'resposta');
+        } else {
+          throw new Error('sendPttFromBase64 indisponível');
+        }
+        break;
+      default:
+        throw new Error('engine sem suporte a PTT');
+    }
+    return true;
+  } catch (err) {
+    customLogger.error(`[MessageSender] Falha ao enviar PTT (${engine}) -> ${err.message}`);
+    return false;
+  }
+}
+
+async function baixarComoBase64(url) {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ao baixar ${url}`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  return { base64: buffer.toString('base64'), mimetype: resp.headers.get('content-type') || null };
+}
+
+/**
+ * Manda um arquivo (imagem ou documento) a partir de uma URL pública.
+ * Imagem vai como foto; qualquer outro mime (PDF) vai como documento.
+ */
+async function sendFileFromUrl({ client, to, url, filename, mimetype, caption, session }) {
+  if (!client || !to || !url) return false;
+  registerSystemMedia(session, to);
+  const engine = await detectEngine(client);
+  try {
+    const baixado = await baixarComoBase64(url);
+    const mime = mimetype || baixado.mimetype || 'application/octet-stream';
+    const nome = filename || url.split('/').pop() || 'arquivo';
+    switch (engine) {
+      case 'webjs': {
+        const { MessageMedia } = require('whatsapp-web.js');
+        const media = new MessageMedia(mime, baixado.base64, nome);
+        await client.sendMessage(to, media, {
+          sendSeen: false,
+          caption: caption || undefined,
+          sendMediaAsDocument: !mime.startsWith('image/'),
+        });
+        break; }
+      case 'wppconnect':
+      case 'venom': {
+        const dataUrl = `data:${mime};base64,${baixado.base64}`;
+        if (typeof client.sendFileFromBase64 === 'function') {
+          await client.sendFileFromBase64(to, dataUrl, nome, caption || '');
+        } else if (typeof client.sendFile === 'function') {
+          await client.sendFile(to, dataUrl, nome, caption || '');
+        } else {
+          throw new Error('sendFileFromBase64 indisponível');
+        }
+        break; }
+      default:
+        throw new Error('engine sem suporte a arquivo');
+    }
+    return true;
+  } catch (err) {
+    customLogger.error(`[MessageSender] Falha ao enviar arquivo (${engine}) -> ${err.message}`);
+    return false;
+  }
+}
+
+module.exports = { sendText, sendPtt, sendFileFromUrl, startTyping, startRecording, stopTyping, detectEngine, verifyNumber };

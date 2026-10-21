@@ -64,7 +64,11 @@ if (!ENGINE || !validEngines.includes(ENGINE)) {
 module.exports = {
     port: PORT,
     host: "",
-    host_ssl: HOST_SSL ? HOST_SSL : `${HOST}:${PORT}`,
+    // Sem HOST nem HOST_SSL (o k8s não define nenhum) isto virava "undefined:3333", e o
+    // keepalive, que se chama por esta URL, falhava calado a cada ciclo ("Unsupported
+    // protocol undefined:") — desde 23/09/2026 nenhuma sessão caída voltou sozinha.
+    // Vazio, ele cai no próprio padrão: http://127.0.0.1:PORT.
+    host_ssl: HOST_SSL || (HOST ? `${HOST}:${PORT}` : ''),
     token: TOKEN,
     https: HTTPS,
     version: VERSION,

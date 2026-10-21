@@ -8,19 +8,33 @@ const cors = require("cors");
 const path = require("path");
 const { yo } = require("yoo-hoo");
 const config = require("./config");
-const { startAllSessions, startCleanupJobs } = require("./startup");
-const SessionsHelper = require("./controllers/helper/core/sessions.js");
-const { startSessionKeepAliveJob } = require("./jobs/sessionKeepAlive");
-const logger = require("./util/logger"); // Para expressPinoLogger  
+const logger = require("./util/logger"); // Para expressPinoLogger
 const customLogger = require("./util/customLogger"); // Logger padronizado
 const expressPinoLogger = require("express-pino-logger");
 const emailAlertService = require("./services/emailAlertService"); // 📧 Alertas por email
-const authApi = require("./routers/Auth");
-const chatRouter = require("./routers/Chat");
+
+// Núcleo PESADO (startup/SessionsHelper/rotas puxam a cadeia whatsapp-web.js →
+// puppeteer inteira) carregado só DEPOIS do listen — ver carregarNucleo().
+// No primeiro boot de um pack novo o antivírus escaneia milhares de arquivos e
+// esses requires passavam de 60s em máquina de cliente: o /health só nascia no
+// fim, o gerenciador matava o processo no meio do aquecimento e re-extraía o
+// zip — loop de morte da frota (incidente real, 01/09). Com o listen cedo, o
+// /health responde "starting" em ~2s em qualquer máquina.
+let startAllSessions, startCleanupJobs, SessionsHelper, startSessionKeepAliveJob, startDailyRestartJob;
+let authApi, chatRouter;
 
 // Verifica se o diretório de instâncias existe, senão cria
 if (!fs.existsSync("./instances")) {
   fs.mkdirSync("./instances");
+}
+
+// database/ tambem precisa existir ANTES do Sequelize abrir o sqlite: sem a
+// pasta, o authenticate() do config.js so loga o erro, o servidor sobe assim
+// mesmo e cada endpoint falha depois com um erro confuso de banco. Relativo ao
+// CWD de proposito — e o CWD (junto com instances/ e .env) que define onde
+// moram os DADOS da instalacao.
+if (!fs.existsSync("./database")) {
+  fs.mkdirSync("./database", { recursive: true });
 }
 
 // Inicialização do servidor Express
@@ -71,8 +85,8 @@ app.use(
   })
 );
 
-// Configuração da pasta de arquivos estáticos
-app.use(express.static("public"));
+// Configuração da pasta de arquivos estáticos (sempre relativa ao codigo —
+// o CWD agora pode ser o diretorio de DADOS, separado do de instalacao)
 app.use(express.static(path.join(__dirname, "/public")));
 
 // Configuração do view engine e da pasta de views
@@ -111,30 +125,62 @@ io.on("connection", (socket) => {
   });
 });
 
-// Configuração de rotas baseada na engine selecionada
-let router;
+// Configuração de rotas baseada na engine selecionada — dentro do
+// carregarNucleo() para rodar DEPOIS do listen (ver nota nos requires).
 const engine = config.engine;
+let bootCompleto = false;
 
-if (engine === '1') {
-  router = require("./routers/WhatsappWebJS");
-  customLogger.success('🚀 Engine selecionada: WhatsApp-Web-JS');
-} else if (engine === '2') {
-  router = require("./routers/WppConnect");
-  customLogger.success('🚀 Engine selecionada: WPPConnect');
-} else if (engine === '3') {
-  router = require("./routers/Venom");
-  customLogger.success('🚀 Engine selecionada: Venom');
-} else {
-  customLogger.error('Engine não reconhecida. Use 1 (WhatsappWebJS), 2 (WppConnect) ou 3 (Venom).');
-  process.exit(1);
-}
+const carregarNucleo = () => {
+  ({ startAllSessions, startCleanupJobs } = require("./startup"));
+  SessionsHelper = require("./controllers/helper/core/sessions.js");
+  ({ startSessionKeepAliveJob } = require("./jobs/sessionKeepAlive"));
+  ({ startDailyRestartJob } = require("./jobs/dailyRestart"));
+  authApi = require("./routers/Auth");
+  chatRouter = require("./routers/Chat");
 
-const manager = require("./routers/Manager");
+  let router;
+  if (engine === '1') {
+    router = require("./routers/WhatsappWebJS");
+    customLogger.success('🚀 Engine selecionada: WhatsApp-Web-JS');
+  } else if (engine === '2' || engine === '3') {
+    // Build enxuto (v3) so embarca a engine 1. As engines 2/3 continuam no
+    // codigo, mas as dependencias delas (wppconnect/venom) sairam do pacote —
+    // um require direto estouraria MODULE_NOT_FOUND sem explicacao.
+    try {
+      router = engine === '2' ? require("./routers/WppConnect") : require("./routers/Venom");
+      customLogger.success(`🚀 Engine selecionada: ${engine === '2' ? 'WPPConnect' : 'Venom'}`);
+    } catch (err) {
+      customLogger.error(`Engine ${engine} não está incluída neste pacote (build enxuto, ENGINE=1). ` +
+        'Reinstale as dependências da engine desejada ou use ENGINE=1. Detalhe: ' + err.message);
+      process.exit(1);
+    }
+  } else {
+    customLogger.error('Engine não reconhecida. Use 1 (WhatsappWebJS), 2 (WppConnect) ou 3 (Venom).');
+    process.exit(1);
+  }
 
-app.use(router, loggerMiddleware);
-app.use(manager);
-app.use(authApi);
-app.use(chatRouter);
+  const manager = require("./routers/Manager");
+
+  app.use(router, loggerMiddleware);
+  app.use(manager);
+  app.use(authApi);
+  app.use(chatRouter);
+
+  bootCompleto = true;
+};
+
+// Registrado ANTES do /health completo: enquanto o núcleo aquece, responde
+// "starting" na hora — o supervisor vê processo vivo e espera em vez de matar.
+// Com o núcleo pronto, cai (next) no /health completo logo abaixo.
+app.get('/health', (req, res, next) => {
+  if (bootCompleto) return next();
+  res.status(200).json({
+    ok: true,
+    status: 'starting',
+    starting: true,
+    uptime_s: Math.round(process.uptime()),
+  });
+});
 
 const toPlainDevice = (device) => (device?.get ? device.get({ plain: true }) : device);
 
@@ -199,6 +245,9 @@ app.get('/health', async (req, res) => {
 
 app.get('/health/sessions', async (req, res) => {
   try {
+    if (!bootCompleto) {
+      return res.status(200).json({ status: 'starting', sessions: [] });
+    }
     const devices = await SessionsHelper.listDevices();
     const items = devices.map((device) => {
       const row = toPlainDevice(device);
@@ -258,12 +307,26 @@ server.listen(config.port, async (error) => {
   if (error) {
     customLogger.error(error);
   } else {
+    // Porta já aberta: /health responde "starting" enquanto o núcleo aquece.
+    // Falha no núcleo = morrer ALTO (exit 1) — sem o catch, o throw dentro
+    // deste callback async virava unhandled rejection e o processo ficava
+    // zumbi: porta aberta, "starting" para sempre, nenhuma rota montada.
+    const t0 = Date.now();
+    try {
+      carregarNucleo();
+    } catch (err) {
+      customLogger.error(`💀 Núcleo não subiu: ${err.message}`);
+      customLogger.error(err.stack || String(err));
+      process.exit(1);
+    }
+    customLogger.info(`🧩 Núcleo carregado em ${Math.round((Date.now() - t0) / 1000)}s (porta aberta desde o boot)`);
+
     yo("Myzap3", { color: "rainbow", spacing: 1, waitMode: "line" });
 
     const serverURL = config.host_ssl
       ? config.host_ssl
       : `${config.host}:${config.port}`;
-    
+
     customLogger.success(`\n🚀 Server running on ${serverURL}`);
     customLogger.info(`📚 Access ${serverURL}/doc to view API documentation`);
     customLogger.info(`🤫 Engine: ${engine === '1' ? 'WhatsApp-Web-JS' : engine === '2' ? 'WPPConnect' : 'Venom'}`);
@@ -283,6 +346,10 @@ server.listen(config.port, async (error) => {
     startCleanupJobs();
 
     startSessionKeepAliveJob();
+
+    // Reinício diário pelo próprio processo (o cron com `pm2 restart` não achava o pm2):
+    // na hora marcada chama o mesmo desligamento limpo do SIGTERM e o PM2 religa.
+    startDailyRestartJob(gracefulShutdown);
   }
 });
 
@@ -294,12 +361,53 @@ process.on("exit", handleProcessExit);
 process.on("uncaughtException", handleUncaughtException);
 process.on("unhandledRejection", handleUnhandledRejection);
 
-function gracefulShutdown(signal) {
-  customLogger.info(`Received ${signal}. Starting graceful shutdown...`);
-  server.close(() => {
-    customLogger.info("Server closed. Exiting process...");
-    process.exit(0);
+// Encerramento LIMPO: destruir os clients ANTES de sair. Sem isso o Chrome de
+// cada sessão ficava órfão segurando o SingletonLock do perfil (instances/) e
+// a porta — no Windows isso travava o restart/update e podia corromper a
+// sessão. O gerenciador compensava com kill de árvore; agora o próprio MyZap
+// solta tudo em até ~8s e o supervisor não precisa de força bruta.
+let shuttingDown = false;
+async function destroyAllClientsSafe(timeoutMs = 8000) {
+  const entries = Object.entries((SessionsHelper && SessionsHelper.clients) || {});
+  if (entries.length === 0) return;
+  customLogger.info(`Encerrando ${entries.length} sessão(ões) antes de sair...`);
+  const teardown = entries.map(async ([sessionName, client]) => {
+    try {
+      if (client && typeof client.destroy === "function") {
+        await client.destroy(); // whatsapp-web.js
+      } else if (client && typeof client.close === "function") {
+        await client.close(); // wppconnect / venom
+      }
+      customLogger.info(`Sessão ${sessionName} encerrada.`);
+    } catch (err) {
+      customLogger.error(`Falha ao encerrar sessão ${sessionName}: ${err.message}`);
+    }
   });
+  await Promise.race([
+    Promise.allSettled(teardown),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  customLogger.info(`Received ${signal}. Starting graceful shutdown...`);
+
+  // Deadline dura: mesmo que um destroy pendure, o processo sai.
+  const hardExit = setTimeout(() => process.exit(0), 12000);
+  hardExit.unref();
+
+  destroyAllClientsSafe()
+    .catch(() => {})
+    .finally(() => {
+      server.close(() => {
+        customLogger.info("Server closed. Exiting process...");
+        process.exit(0);
+      });
+      // server.close espera conexões keep-alive; não seguramos mais que 3s.
+      setTimeout(() => process.exit(0), 3000).unref();
+    });
 }
 
 function handleProcessExit(code) {

@@ -242,8 +242,8 @@ pnpm dev
 ### Produção
 
 ```bash
-# Iniciar com PM2
-pm2 start index.js --name myzap
+# Iniciar com PM2 — pelo ecosystem (é ele que dá tempo de fechar os Chromes no restart)
+pm2 start ecosystem.config.js --env production
 
 # Ou usar o script
 bash ./scripts/start.sh
@@ -361,8 +361,8 @@ A IA pode consultar documentos específicos (manuais, catálogos, políticas) at
 # Instalar PM2
 npm install -g pm2
 
-# Iniciar aplicação
-pm2 start index.js --name myzap
+# Iniciar aplicação (sempre pelo ecosystem: kill_timeout para fechar os Chromes)
+pm2 start ecosystem.config.js --env production
 
 # Configurar inicialização automática
 pm2 startup
@@ -373,15 +373,12 @@ pm2 logs myzap
 pm2 monit
 ```
 
-### Restart Automático (Cron)
+### Restart Automático
 
-```bash
-# Editar crontab
-crontab -e
-
-# Adicionar linha (reinicia todo dia às 3h da manhã)
-0 3 * * * pm2 restart myzap
-```
+Sob PM2 o próprio MyZap se reinicia todo dia (padrão 3h, fuso de Brasília) com o
+desligamento limpo — não precisa de cron (o `pm2 restart` no cron nem achava o pm2, que
+vive no nvm). `REINICIO_DIARIO_HORA` muda a hora, `REINICIO_DIARIO=0` desliga. Detalhes em
+[CONFIGURACAO_RESTART_AUTOMATICO.md](CONFIGURACAO_RESTART_AUTOMATICO.md).
 
 ### Nginx (Proxy Reverso)
 

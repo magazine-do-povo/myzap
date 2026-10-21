@@ -27,7 +27,8 @@ module.exports = class Venom {
       const currentAttemptsStart = existingDevice?.attempts_start || 0;
 
       // Payload completo seguindo padrão WPPConnect
-      const sysUser = await User.findOne({ where: { email: process.env.EMAIL } });
+      const { getOrCreateSystemUser } = require('../controllers/helper/core/systemUser.js');
+      const sysUser = await getOrCreateSystemUser();
       const payload = {
         user_id: sysUser?.id,
         session,

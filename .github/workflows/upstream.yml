@@ -1,0 +1,222 @@
+name: Upstream (billbarsch/myzap)
+
+# Vigia do repositório OFICIAL, billbarsch/myzap (branch myzap2.0, o padrão dele). Roda SÓ no pai,
+# JZ-TECH-SYS/myzap: os filhos recebem este arquivo pela sincronização (sync-pai.yml), mas o `if`
+# do job o desliga neles. Todo dia às 08:27 de Brasília (o agendamento do GitHub atrasa horas, e
+# nada aqui depende do horário):
+#
+# 1. Compara a main com o myzap2.0 do oficial.
+# 2. Se o oficial tem commits que a main não tem, faz o merge dele no branch `upstream/auto` (por
+#    cima do que já estiver lá, nunca force-push), roda o build/teste offline e abre (ou atualiza)
+#    o PR para a main marcando o @joaosn. NÃO mescla sozinho: o oficial precisa de revisão.
+# 3. Conflito, ou merge que muda .github/workflows/ (o GITHUB_TOKEN não pode gravar workflow): não
+#    empurra nada. O aviso vai na issue com a lista de arquivos e o merge fica à mão.
+# 4. Quando o oficial anda, comenta na issue "Acompanhamento do upstream" (label upstream) marcando
+#    o @joaosn (o GitHub avisa por e-mail): os commits novos e o resultado do item 2.
+#
+# SEM COMMIT EM COMUM: a main é uma cópia REESCRITA do oficial (a raiz bd4e7fa é o aaf6413 dele sem
+# a assinatura GPG; 311 commits com a mesma árvore e outro SHA), e o git recusa o merge ("unrelated
+# histories"). Enquanto um merge do oficial não entrar na main, o robô liga os históricos no próprio
+# upstream/auto com `merge -s ours` do commit mais novo do oficial cuja árvore a main já tem (em
+# 21/10/2026, o 478edb9 de 16/07/2024). Não muda arquivo nenhum: só dá ao git a base certa.
+#
+# Build/teste: pnpm install, node --check e os testes do package.json + o boot, SEM REDE (namespace
+# só com loopback): nada chega a IA, WhatsApp ou API de verdade, e o runner não tem chave nenhuma.
+# Push e PR feitos com o GITHUB_TOKEN não disparam o smoke.yml (regra do GitHub contra laço de
+# workflows): por isso o teste roda aqui e o resultado vai escrito no PR.
+# A família inteira (oficial → pai → filhos): docs/jztech/familia-myzap.md.
+on:
+  schedule:
+    - cron: "27 11 * * *"   # 08:27 em Brasília (UTC-3, sem horário de verão)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+
+jobs:
+  vigiar:
+    if: github.repository == 'JZ-TECH-SYS/myzap'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # empurrar o branch upstream/auto
+      pull-requests: write   # abrir/atualizar o PR
+      issues: write          # comentar na issue de acompanhamento
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      OFICIAL: billbarsch/myzap
+      RAMO_OFICIAL: myzap2.0
+      GUIA: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/jztech/familia-myzap.md
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Comparar com o oficial
+        id: comparar
+        run: |
+          set -euo pipefail
+          # o oficial é público: busca anônima, sem o token que o checkout deixa no git config
+          git -c http.https://github.com/.extraheader= fetch -q --no-tags "https://github.com/$OFICIAL.git" "+refs/heads/$RAMO_OFICIAL:refs/remotes/oficial/$RAMO_OFICIAL"
+          up=$(git rev-parse "oficial/$RAMO_OFICIAL")
+          ancora=""
+          if ! git merge-base origin/main "oficial/$RAMO_OFICIAL" >/dev/null; then
+            # o awk lê tudo e escolhe no fim (sair no meio daria SIGPIPE no git log e o pipefail mataria o passo)
+            ancora=$(git log --topo-order --format='%H %T' "oficial/$RAMO_OFICIAL" \
+              | awk 'NR==FNR {t[$1]; next} a == "" && ($2 in t) {a = $1} END {print a}' <(git log --format=%T origin/main) -)
+            if [ -z "$ancora" ]; then echo "::error::a main e o oficial não têm commit nem árvore em comum"; exit 1; fi
+            echo "sem commit em comum com o oficial: âncora ${ancora:0:7} (mesma árvore de um commit da main)"
+          fi
+          faltam=$(git rev-list --count "origin/main..oficial/$RAMO_OFICIAL" ${ancora:+"^$ancora"})
+          gh label create upstream --color 5319e7 --description "Acompanhamento do $OFICIAL" --force >/dev/null
+          num=$(gh issue list --label upstream --state open --json number --jq '.[0].number // empty')
+          if [ -z "$num" ]; then
+            url=$(gh issue create --title "Acompanhamento do upstream ($OFICIAL)" --label upstream --assignee joaosn --body "Vigia diário do repositório oficial (workflow \`upstream.yml\`).")
+            num=${url##*/}
+          fi
+          antes=$(gh issue view "$num" --json body --jq .body | sed -n 's/.*ultimo_upstream: \([0-9a-f]*\).*/\1/p')
+          novo=nao
+          if [ "$faltam" != 0 ] && [ "$antes" != "$up" ]; then novo=sim; fi
+          printf 'up=%s\nancora=%s\nfaltam=%s\nnum=%s\nantes=%s\nnovo=%s\n' "$up" "$ancora" "$faltam" "$num" "$antes" "$novo" >> "$GITHUB_OUTPUT"
+          echo "oficial em ${up:0:7}: $faltam commit(s) que a main não tem"
+
+      - name: Merge do oficial no branch upstream/auto
+        id: juntar
+        if: steps.comparar.outputs.faltam != '0'
+        env:
+          UP: ${{ steps.comparar.outputs.up }}
+          ANCORA: ${{ steps.comparar.outputs.ancora }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          conflito() {
+            { echo estado=conflito; echo 'arquivos<<FIM'; git diff --name-only --diff-filter=U; echo FIM; } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 0
+          }
+          base=origin/main
+          if git rev-parse -q --verify origin/upstream/auto >/dev/null; then base=origin/upstream/auto; fi
+          git switch -q -C upstream/auto "$base"
+          git merge -q --no-edit origin/main || conflito   # o que entrou na main desde o PR anterior (nada, se o branch é novo)
+          if [ -n "$ANCORA" ] && ! git merge-base --is-ancestor "$ANCORA" HEAD; then
+            git merge -q -s ours --allow-unrelated-histories --no-edit \
+              -m "chore(sync): liga o histórico ao oficial $OFICIAL (${ANCORA:0:7}, árvore que a main já tem)" "$ANCORA"
+          fi
+          git merge -q --no-ff --no-edit -m "chore(sync): merge do oficial $OFICIAL (${UP:0:7})" "oficial/$RAMO_OFICIAL" || conflito
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$base")" ]; then
+            echo estado=em-dia >> "$GITHUB_OUTPUT"
+            echo "o branch upstream/auto já tem o oficial e a main"
+            exit 0
+          fi
+          # O GitHub recusa push do GITHUB_TOKEN que muda workflow (vale o diff do push).
+          wf=$(git diff --name-only "$base" HEAD -- .github/workflows)
+          if [ -n "$wf" ]; then
+            { echo estado=workflow; echo 'arquivos<<FIM'; echo "$wf"; echo FIM; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo estado=merge >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.juntar.outputs.estado == 'merge'
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        if: steps.juntar.outputs.estado == 'merge'
+
+      - name: Build e testes (offline, sem rede)
+        id: testes
+        if: steps.juntar.outputs.estado == 'merge'
+        continue-on-error: true   # o PR abre mesmo assim, com o resultado escrito; o job fica vermelho no fim
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1"
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          git ls-files -z '*.js' ':!:public/libs/**' | xargs -0 -n1 node --check
+          # Ubuntu 24.04 barra namespace sem root pelo AppArmor; sem ele o unshare falha e o passo
+          # fica vermelho (nunca roda os testes com rede).
+          sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn sh -ec 'ip link set lo up; pnpm test; node test/boot-test.js'
+
+      - name: Empurrar o branch e abrir/atualizar o PR
+        id: pr
+        if: steps.juntar.outputs.estado == 'merge'
+        env:
+          UP: ${{ steps.comparar.outputs.up }}
+          ANCORA: ${{ steps.comparar.outputs.ancora }}
+          TESTES: ${{ steps.testes.outcome }}
+        run: |
+          set -euo pipefail
+          git push -q origin upstream/auto
+          if [ "$TESTES" = success ]; then teste="✅ Build e testes passaram (pnpm install, node --check, testes do package.json e boot, sem rede)."; else teste="❌ **Build ou testes falharam**: veja o [run]($RUN) e corrija neste branch."; fi
+          ligacao=""
+          if [ -n "$ANCORA" ]; then ligacao=$(printf '\n\nO primeiro commit do PR liga os históricos (`merge -s ours` do `%s`, sem mudar arquivo): a main é uma cópia reescrita do oficial e o git não achava base. Depois deste merge, os próximos são merges normais.' "${ANCORA:0:7}"); fi
+          titulo="chore(sync): oficial $OFICIAL ${UP:0:7}"
+          commits=$(git log --no-merges --max-count=40 --format="- %as [\`%h\`](https://github.com/$OFICIAL/commit/%H) %s" "origin/main..oficial/$RAMO_OFICIAL" ${ANCORA:+"^$ANCORA"})
+          corpo=$(printf '@joaosn o oficial andou. Merge do `%s` (`%s`) em `%s` para revisar.\n\n%s%s\n\nEste PR **nunca é mesclado sozinho**: o que é nosso (deploy, k8s, IA, sessão) está no [guia](%s). Depois do merge, os filhos recebem sozinhos na madrugada seguinte (`sync-pai.yml`).\n\nCommits do oficial que entram:\n\n%s\n' "$OFICIAL" "$RAMO_OFICIAL" "${UP:0:7}" "$teste" "$ligacao" "$GUIA" "$commits")
+          pr=$(gh pr list --head upstream/auto --base main --state open --json url --jq '.[0].url // empty')
+          if [ -z "$pr" ]; then
+            pr=$(gh pr create --base main --head upstream/auto --assignee joaosn --title "$titulo" --body "$corpo")
+          else
+            gh api -X PATCH "repos/$GH_REPO/pulls/${pr##*/}" -f title="$titulo" -f body="$corpo" >/dev/null   # REST: o `gh pr edit` antigo quebra no GraphQL
+            gh pr comment "$pr" --body "@joaosn PR atualizado com o oficial em \`${UP:0:7}\`. $teste"
+          fi
+          echo "url=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Avisar na issue
+        if: always() && steps.comparar.outcome == 'success'
+        env:
+          UP: ${{ steps.comparar.outputs.up }}
+          ANCORA: ${{ steps.comparar.outputs.ancora }}
+          FALTAM: ${{ steps.comparar.outputs.faltam }}
+          NUM: ${{ steps.comparar.outputs.num }}
+          ANTES: ${{ steps.comparar.outputs.antes }}
+          NOVO: ${{ steps.comparar.outputs.novo }}
+          ESTADO: ${{ steps.juntar.outputs.estado }}
+          ARQUIVOS: ${{ steps.juntar.outputs.arquivos }}
+          TESTES: ${{ steps.testes.outcome }}
+          PR: ${{ steps.pr.outputs.url }}
+        run: |
+          set -euo pipefail
+          lista() { git log --no-merges --max-count=40 --format="- %as [\`%h\`](https://github.com/$OFICIAL/commit/%H) %s" "$@"; }
+          arquivos=$(printf '%s\n' "$ARQUIVOS" | sed '/^$/d; s/^/- `/; s/$/`/')
+          case "$ESTADO" in
+            merge)
+              if [ "$TESTES" = success ]; then r="build e testes passaram"; else r="❌ build ou testes falharam, ver o [run]($RUN)"; fi
+              resultado="PR para revisar: $PR ($r)."
+              if [ -z "$PR" ]; then resultado="⚠️ O PR não abriu: veja o [run]($RUN). Se ele disser \"not permitted to create or approve pull requests\", o Actions não pode abrir PR aqui (seção \"Permissões\" do guia)."; fi;;
+            conflito)
+              resultado=$(printf '⚠️ **O merge automático deu conflito** em:\n\n%s\n\nNada foi empurrado: faça o merge à mão pelo [guia](%s).' "$arquivos" "$GUIA");;
+            workflow)
+              resultado=$(printf '⚠️ **O merge muda `.github/workflows/`:**\n\n%s\n\nO GITHUB_TOKEN não pode gravar workflow, então nada foi empurrado: faça o merge à mão pelo [guia](%s) (e decida quais workflows do oficial ficam).' "$arquivos" "$GUIA");;
+            em-dia)
+              resultado="O branch \`upstream/auto\` já tem estes commits.";;
+            *)
+              resultado="⚠️ O merge automático não terminou: veja o [run]($RUN).";;
+          esac
+          if [ "$FALTAM" = 0 ]; then
+            corpo=$(printf 'Vigia diário do repositório oficial (workflow `upstream.yml`).\n\n**Em dia:** a main já tem o oficial em `%s`.\n\n<!-- ultimo_upstream: %s -->\n' "${UP:0:7}" "$UP")
+          else
+            resumo="**$FALTAM commit(s) do oficial ainda não estão na main.** Como trazer: [guia]($GUIA)."
+            corpo=$(printf 'Vigia diário do repositório oficial (workflow `upstream.yml`). Lista do que falta trazer:\n\n%s\n\n%s\n\n<!-- ultimo_upstream: %s -->\n\n%s\n' "$resumo" "$resultado" "$UP" "$(lista "origin/main..oficial/$RAMO_OFICIAL" ${ANCORA:+"^$ANCORA"})")
+          fi
+          if [ "$NOVO" = sim ]; then
+            if [ -n "$ANTES" ] && git cat-file -e "$ANTES^{commit}" 2>/dev/null; then novos=$(lista "$ANTES..$UP"); else novos=$(lista "origin/main..oficial/$RAMO_OFICIAL" ${ANCORA:+"^$ANCORA"}); fi
+            gh issue comment "$NUM" --body "$(printf '@joaosn o oficial do MyZap andou.\n\n%s\n\n%s\n\n%s\n' "$resumo" "$resultado" "$novos")"
+          fi
+          if [ "$(gh issue view "$NUM" --json body --jq .body)" != "$corpo" ]; then gh issue edit "$NUM" --body "$corpo"; fi
+          echo "issue #$NUM: $FALTAM commit(s) do oficial pendentes (${ESTADO:-sem merge})"
+
+      - name: Falhar se o build/teste do merge falhou
+        if: steps.testes.outcome == 'failure'
+        run: |
+          echo "::error::o merge do oficial não passou no build/teste; o PR ficou aberto para correção"
+          exit 1

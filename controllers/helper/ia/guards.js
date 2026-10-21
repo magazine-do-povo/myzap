@@ -1,5 +1,6 @@
 const ChatHistoryHelper = require('../events/chatHistory');
 const HumanDetector = require('./humanDetector');
+const AgenteClient = require('./agenteClient');
 const { HUMAN_PAUSE_MINUTES } = require('./iaConfig');
 
 /**
@@ -22,6 +23,21 @@ async function checkGroupMessage({ message }) {
   return { shouldBlock: false };
 }
 
+/**
+ * Mensagem que chega ATRASADA (mais de 10 min) não vai para a IA. Depois de uma
+ * queda, a sessão recebe de uma vez tudo o que ficou represado, e muito era
+ * conversa com a EQUIPE ("Maria deu certo", "Maria o Nicao passou aí" — Sonhare,
+ * 26/09): a IA respondia, uma hora depois, mensagens que não eram para ela.
+ */
+const ATRASO_MAXIMO_SEG = 10 * 60;
+async function checkMensagemAtrasada({ message }) {
+  const ts = Number(message && message.timestamp) || 0;
+  if (ts > 0 && Math.floor(Date.now() / 1000) - ts > ATRASO_MAXIMO_SEG) {
+    return { shouldBlock: true, reason: 'mensagem_atrasada' };
+  }
+  return { shouldBlock: false };
+}
+
 async function checkCompanyEnabled({ empresa }) {
   if (!empresa) {
     return { shouldBlock: true, reason: 'empresa_nao_encontrada' };
@@ -29,7 +45,19 @@ async function checkCompanyEnabled({ empresa }) {
   return { shouldBlock: false };
 }
 
-async function checkIaEnabled({ empresa }) {
+async function checkIaEnabled({ empresa, sessionkey }) {
+  // Fonte da verdade = toggle do painel do ClickExpress. No modo local a
+  // config remota espelha o toggle (cache <=10min no agenteClient) — assim
+  // ativar pela web liga o worker da maquina sem mexer no banco local.
+  // null (env AGENT_URL setada, API fora, campo ausente) = cai no banco local.
+  if ((process.env.IA_PROVIDER || '').toLowerCase() === 'agente') {
+    const painel = await AgenteClient
+      .iaAtivaRemota(sessionkey, empresa?.api_url || null)
+      .catch(() => null);
+    if (painel === true) return { shouldBlock: false };
+    if (painel === false) return { shouldBlock: true, reason: 'ia_desligada' };
+  }
+
   const iaAtiva = empresa.ia_ativa !== false;
   if (!iaAtiva) {
     return { shouldBlock: true, reason: 'ia_desligada' };
@@ -108,6 +136,7 @@ async function checkFirstContactToday({ session, sessionkey, numero }) {
 
 module.exports = {
   checkGroupMessage,
+  checkMensagemAtrasada,
   checkCompanyEnabled,
   checkIaEnabled,
   checkHumanRequest,

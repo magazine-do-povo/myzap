@@ -9,6 +9,12 @@ const CONNECTED_STATES = new Set(['CONNECTED', 'inChat', 'isLogged', 'isConnecte
 // Status que indicam que a sessão está aguardando QR Code (NÃO tentar reiniciar)
 const WAITING_QR_STATUSES = new Set(['qrCode', 'QRCODE', 'WAITING_QR', 'INITIALIZING', 'STARTING']);
 
+// Só volta com alguém lendo um QR novo: LOGOUT ou QR que ninguém leu (`notLogged`, gravado no
+// 'disconnected' do engine) e sessão que o WhatsApp recusou (AUTH_FAIL). Religar sozinho só
+// subiria um Chrome para mostrar QR a ninguém, a cada ciclo — e o start zera attempts_start, então
+// o MAX_START_ATTEMPTS nunca segurava. Volta quando alguém conectar pelo painel.
+const PRECISA_QR = new Set(['notLogged', 'AUTH_FAIL']);
+
 // Configurações de controle de tentativas
 const MAX_START_ATTEMPTS = 10; // AUMENTADO: Máximo de tentativas antes de parar
 const QR_COOLDOWN_MINUTES = 5; // REDUZIDO: Minutos de espera entre tentativas quando tem QR
@@ -69,7 +75,12 @@ function isEligible(device) {
   // NOVO - Verificar se está aguardando QR Code ou inicializando (NÃO tentar reiniciar)
   const status = device.status || '';
   const state = device.state || '';
-  
+
+  if (PRECISA_QR.has(status)) {
+    customLogger.debug(`[SESSION KEEPALIVE] ${device.session} precisa de QR novo (${status}) - pulando`);
+    return false;
+  }
+
   // CRÍTICO - Nunca interferir enquanto está inicializando
   if (WAITING_QR_STATUSES.has(status) || WAITING_QR_STATUSES.has(state)) {
     // Verificar se já passou tempo suficiente desde a última tentativa
@@ -98,8 +109,8 @@ function isEligible(device) {
     return false;
   }
 
-  // CORRIGIDO - Também reconectar sessões que caíram (DISCONNECTED, TIMEOUT, notLogged)
-  const RECONNECT_STATUSES = new Set(['DISCONNECTED', 'TIMEOUT', 'notLogged', 'disconnected']);
+  // CORRIGIDO - Também reconectar sessões que caíram (DISCONNECTED, TIMEOUT)
+  const RECONNECT_STATUSES = new Set(['DISCONNECTED', 'TIMEOUT', 'disconnected']);
   
   if (!config.session_keepalive_only_connected) {
     return true;
@@ -240,4 +251,5 @@ module.exports = {
   // forma de abrir sessão no processo, e não duas com comportamentos diferentes.
   triggerStart,
   resolveBaseUrl,
+  isEligible, // exposto para o teste (test/reconexao-sessao.js)
 };

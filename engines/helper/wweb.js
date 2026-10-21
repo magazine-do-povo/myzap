@@ -267,6 +267,16 @@ module.exports = {
       ...(webVersion ? { webVersion } : {}),
       webVersionCache,
       puppeteer: {
+        // Chrome SEM o D-Bus da sessão do usuário. O pm2 herdou de um SSH antigo
+        // DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus; com ele, o Chrome se põe DENTRO da
+        // sessão systemd do root (user@0.service) — e morre junto quando ela para.
+        // Na VPS, o cron de minuto em minuto do DisparaZap (como root) abre e fecha
+        // essa sessão 60x por hora: de 25/09 00h às 09h todo Chrome das sessões levou
+        // SIGABRT ~1 min depois de subir (core dump no mesmo segundo do "Stopped User
+        // Manager for UID 0"), e o health check via "detached Frame"/zumbi em ciclo de
+        // 6 min. O `loginctl enable-linger root` resolveu na VPS; isto garante em
+        // qualquer máquina. Headless não precisa do barramento da sessão para nada.
+        env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' },
         // CORRIGIDO - headless: true para não abrir navegador automaticamente
         headless: true, // MUDADO: true para evitar abrir navegador visual
         // MELHORADO - Timeouts maiores para estabilidade

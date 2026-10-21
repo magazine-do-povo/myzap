@@ -49,7 +49,7 @@ class StatusAckManager {
         wook: 'MESSAGE_STATUS',
         status,
         type,
-        id: msg?.id?._serialized || msg?.id,
+        id: msg?.id?._serialized || msg?.id?.$1 || msg?.id, // `$1`: o id no WhatsApp Web de set/2026
         from: msg?.from?.split('@')[0] || 'unknown',
         to: msg?.to?.split('@')[0] || 'unknown',
         session,

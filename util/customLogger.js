@@ -2,8 +2,13 @@ const fs = require('fs');
 const path = require('path');
 const chalk = require('chalk');
 
-// Criar pasta de logs se não existir
-const logsDir = path.join(__dirname, '..', 'logs');
+// Criar pasta de logs se não existir. Relativo ao CWD (e não ao código): o CWD
+// é o diretório de DADOS da instalação — com código e dados separados (v3),
+// os logs sobrevivem à troca de versão. No layout antigo (CWD = pasta do
+// código) o caminho resolve para o mesmo lugar de sempre.
+const logsDir = process.env.LOGS_DIR
+    ? path.resolve(process.env.LOGS_DIR)
+    : path.join(process.cwd(), 'logs');
 if (!fs.existsSync(logsDir)) {
     fs.mkdirSync(logsDir, { recursive: true });
 }
