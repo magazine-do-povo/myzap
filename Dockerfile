@@ -3,7 +3,7 @@
 # O upstream roda em VPS com pm2. Aqui o supervisor é o Kubernetes, então o
 # processo é um só (`node index.js`) e quem reinicia é o kubelet.
 #
-# O motor é WhatsApp WEB — ENGINE=1 (whatsapp-web.js), o mesmo da VPS; wppconnect
+# O motor é WhatsApp WEB — ENGINE=1 (whatsapp-web.js), o mesmo que a VPS roda; wppconnect
 # e venom seguem empacotados. Qualquer um precisa de um Chromium de verdade
 # dentro da imagem. Instalamos o do Debian e desligamos o download do Chromium do
 # puppeteer — baixar um segundo navegador dobraria a imagem sem uso.

@@ -1,4 +1,5 @@
 const Sessions = require("../../../controllers/SessionsController");
+const { registerSystemMedia } = require('../../../controllers/helper/ia/iaResponseCache');
 const get = require("async-get-file");
 const fs = require("fs");
 const whatsappweb = require("whatsapp-web.js");
@@ -11,13 +12,89 @@ const customLogger = require('../../../util/customLogger.js'); // Logger padroni
 // 🆕 Importar funções de health check para rastrear envios
 const { registerSendSuccess, registerSendFailure, isClientHealthy } = require('../../../jobs/sessionHealthCheck.js');
 
+const mimeTypes = require("mime-types");
+const { spawn } = require("child_process");
+const os = require("os");
+const path = require("path");
+
 const urlExists = util.promisify(urlExistsImport);
 const { MessageMedia, Location, Poll } = whatsappweb;
+
+// `path` das rotas por tipo (sendImage/sendAudio/...) vira MessageMedia sem passar pelo disco:
+// - data-URI: decodificado como o sendFile64 já faz, mas aqui segue pelas opções do tipo — é o
+//   que faz o áudio sair como nota de voz (sendAudioAsVoice) e a figurinha como figurinha;
+// - URL http(s): baixada em memória. Antes ia para files-received/<último pedaço da URL>: dois
+//   envios do mesmo arquivo ao mesmo tempo se sobrescreviam, o download-file avisava "terminou"
+//   antes de o arquivo acabar de ser gravado, e a query de URL assinada entrava no nome;
+// - o resto é caminho local, como sempre foi (a frota das lojas manda arquivo do disco) — menos
+//   com BLOQUEAR_CAMINHO_LOCAL=true, no motor de várias empresas do cluster.
+async function midiaDoPath(filePath, filename) {
+  if (filePath.startsWith("data:")) {
+    const [cabecalho, base64 = ""] = filePath.split(",");
+    return new MessageMedia(
+      /^data:([^;,]+)/.exec(cabecalho)?.[1] || "application/octet-stream",
+      base64.replace(/\s/g, ""),
+      filename || "arquivo"
+    );
+  }
+  if (/^https?:\/\//i.test(filePath)) {
+    // 20 s como o download-file: o zap desiste do motor em 30 s e reenviaria em duplicidade.
+    const resp = await fetch(filePath, { signal: AbortSignal.timeout(20000) });
+    if (!resp.ok) throw new Error(`Download da mídia falhou: HTTP ${resp.status}`);
+    const nome = new URL(filePath).pathname.split("/").pop() || "arquivo";
+    return new MessageMedia(
+      mimeTypes.lookup(nome) || resp.headers.get("content-type") || "application/octet-stream",
+      Buffer.from(await resp.arrayBuffer()).toString("base64"),
+      filename || nome
+    );
+  }
+  if (process.env.BLOQUEAR_CAMINHO_LOCAL === "true") {
+    throw new Error("Caminho local desligado neste motor: envie URL http(s) ou data-URI");
+  }
+  return MessageMedia.fromFilePath(filePath);
+}
+
+// Nota de voz (PTT) no WhatsApp é ogg/opus. O navegador grava webm/opus (Chrome, Android), mp4/aac
+// (Safari, iPhone) ou ogg/opus (Firefox), e a IA pode mandar mp3: o que não é ogg vira ogg/opus
+// aqui, no ffmpeg da imagem (Dockerfile). Sem ffmpeg (máquina da frota) ou se a conversão falhar,
+// segue o áudio original — como era antes.
+async function comoVoz(media) {
+  if (/^audio\/ogg/i.test(media.mimetype || "")) return media;
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "voz-"));
+  const entrada = path.join(dir, "entrada"); // arquivo, não pipe: mp4 do Safari pode ter o índice no fim
+  try {
+    await fs.promises.writeFile(entrada, Buffer.from(media.data, "base64"));
+    const ogg = await new Promise((ok, falha) => {
+      const p = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", entrada, "-vn",
+        "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000", "-f", "ogg", "pipe:1"]);
+      const partes = [];
+      const relogio = setTimeout(() => p.kill("SIGKILL"), 15000); // o zap desiste do motor em 30 s
+      p.stdout.on("data", (c) => partes.push(c));
+      p.stderr.resume();
+      p.on("error", (e) => { clearTimeout(relogio); falha(e); });
+      p.on("close", (codigo) => {
+        clearTimeout(relogio);
+        codigo === 0 && partes.length ? ok(Buffer.concat(partes)) : falha(new Error(`ffmpeg saiu com ${codigo}`));
+      });
+    });
+    const nome = String(media.filename || "voz").replace(/\.[^.]*$/, "") + ".ogg";
+    return new MessageMedia("audio/ogg; codecs=opus", ogg.toString("base64"), nome);
+  } catch (e) {
+    customLogger.warning(`[VOZ] ${media.mimetype} não virou ogg/opus (${e.message}) — segue o original`);
+    return media;
+  } finally {
+    fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 // CORRIGIDO - Usar Cache.get() igual WPPConnect
 async function buildNumber(req) {
   const number = req.body.number;
-  
+
+  // JID inteiro (ex.: "9775882481727@lid" — cliente @lid, 23/09/2026, loja piloto da Celularis):
+  // já é o destino. Sem isto virava "...@lid@c.us" ou caía no fallback @c.us, que não entrega.
+  if (typeof number === "string" && number.includes("@")) return number;
+
   if (req.body.isGroup) {
     // Para grupos, usar o número diretamente com @g.us
     return number + "@g.us";
@@ -64,7 +141,22 @@ async function formatNumber(rawNumber) {
 // devolvem null em vez de explodir, e o envio continua valendo 200.
 // ---------------------------------------------------------------------------
 function messageId(response) {
-  return response?.id?._serialized ?? null;
+  return idSerializado(response?.id);
+}
+
+// O WhatsApp Web de set/2026 guarda o id serializado em `$1`; na cópia que chega ao Node o
+// `_serialized` pode não vir (23/09/2026, loja piloto da Celularis). Aceita as duas chaves.
+function idSerializado(id) {
+  return id?._serialized ?? id?.$1 ?? null;
+}
+
+// O id serializado é "<fromMe>_<chat>_<id>[_<participante>]" e o chat já traz o servidor (@c.us,
+// @lid, @g.us). O antigo `split('_')[0] + '@c.us'` virava "false@c.us" e a mensagem nunca era
+// achada — nem para citar, reagir, encaminhar ou baixar mídia. Outro formato segue a regra antiga.
+function chatDoId(messageid) {
+  const [inicio, chat] = String(messageid).split("_");
+  if ((inicio === "true" || inicio === "false") && chat?.includes("@")) return chat;
+  return inicio + "@c.us";
 }
 
 function messagePhone(response, fallback = null) {
@@ -80,7 +172,8 @@ module.exports = {
   async sendText(req, res) {
     const session = req.body.session;
     const data = Sessions.getSession(session);
-    const number = await buildNumber(req); // AWAIT adicionado
+    const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // AWAIT adicionado
     const text = req.body.text;
 
     if (!text) {
@@ -188,7 +281,8 @@ module.exports = {
 
   async sendLocation(req, res) {
     const data = Sessions.getSession(req.body.session);
-    const number = await buildNumber(req); // CORRIGIDO - Usar buildNumber()
+    const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // CORRIGIDO - Usar buildNumber()
     const { lat, log, title, description } = req.body;
 
     if (!lat || !log || !title || !description) {
@@ -215,7 +309,8 @@ module.exports = {
 
   async sendContact(req, res) {
     const data = Sessions.getSession(req.body.session);
-    const number = await buildNumber(req); // CORRIGIDO - Usar buildNumber()
+    const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // CORRIGIDO - Usar buildNumber()
 
     if (!req.body.contact || !req.body.name) {
       return res
@@ -245,7 +340,8 @@ module.exports = {
 
   async sendLink(req, res) {
     const data = Sessions.getSession(req.body.session);
-    const number = await buildNumber(req); // AWAIT adicionado
+    const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // AWAIT adicionado
 
     if (!req.body.url) {
       return res
@@ -275,21 +371,17 @@ module.exports = {
 
   async sendMedia(req, res, type) {
     const data = Sessions.getSession(req.body.session);
-    const number = await buildNumber(req); // CORRIGIDO - Usar buildNumber()
+    const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // CORRIGIDO - Usar buildNumber()
     const filePath = req.body.path;
-    const isURL = await urlExists(filePath);
-    const name = filePath?.split(/[\/]/).pop();
-    const dir = "files-received/";
-    const fullPath = isURL ? dir + name : filePath;
 
     if (!filePath) {
       return res.status(400).send({ status: 400, error: "Path não informado" });
     }
 
     try {
-      if (isURL) await get(filePath, { directory: dir });
-
-      const media = MessageMedia.fromFilePath(fullPath);
+      let media = await midiaDoPath(filePath, req.body.filename);
+      if (type === "audio") media = await comoVoz(media); // nota de voz só toca como ogg/opus
       const sendOptions =
         type === "sticker"
           ? { sendMediaAsSticker: true, sendSeen: false }
@@ -302,20 +394,20 @@ module.exports = {
         sendOptions
       );
 
-      if (isURL) fs.unlinkSync(fullPath);
-
       return res.status(200).json({
         result: 200,
         type,
         id: messageId(response),
         session: req.body.session,
         phone: messagePhone(response, number),
-        file: filePath,
+        // data-URI não volta: quem chama guarda esta resposta (o zap, na trilha de status)
+        file: filePath.startsWith("data:") ? media.filename : filePath,
         content: response?.body ?? null,
         mimetype: response?.type ?? null,
       });
     } catch (error) {
-      return res.status(500).json({ status: "error", message: error });
+      // `message: error` virava {} no JSON, e o zap só via "Erro do MyZap (HTTP 500)"
+      return res.status(500).json({ status: "error", message: error?.message ?? error });
     }
   },
 
@@ -348,21 +440,19 @@ module.exports = {
           status: status || 'INITIALIZING'
         };
 
-        const sessionHelper = require('../../../controllers/helper/core/sessions.js');
-        const injectedClient = sessionHelper.getInjectedClient(session);
-
-        // Se tem QR Code no banco E o client que o renova está vivo na memória,
-        // devolver o QR atual. Pós-restart não há client: o QR salvo é um cadáver
-        // (o WhatsApp expira QR em ~1 min) e devolvê-lo prendia a sessão num
-        // código morto para sempre — sem client, o fluxo segue até o
-        // [QR EXPIRED]/[START NEW] logo abaixo, que regenera.
-        if (data.qrCode && data.status === 'qrCode' && injectedClient) {
-          resposta.qrCode = data.qrCode;  // Base64 da imagem do QR Code
+        // Se tem QR Code no banco E o Chrome ainda espera a leitura, devolve ele.
+        // QR de um Chrome que já desistiu é QR morto: cai no [QR EXPIRED] e gera outro.
+        const { qrVivo } = require('../../../controllers/helper/core/qrVivo.js');
+        if (data.qrCode && data.status === 'qrCode' && !qrVivo(session)) {
+          customLogger.info(`[QR MORTO] ${session} - QR do banco sem Chrome esperando: gerando outro`);
+        }
+        if (data.qrCode && data.status === 'qrCode' && qrVivo(session)) {
+          resposta.qrCode = data.qrCode;  // Base64 da imagem do QR Code  
           resposta.urlCode = data.urlCode; // Como estava antes
           resposta.state = 'QRCODE';
           resposta.status = 'qrCode';
           resposta.message = 'QR Code disponível para escaneamento';
-
+          
           customLogger.info(`[START WITH QR] ${session} - Retornando QR Code existente`);
           const http = require('../../../controllers/helper/core/http.js');
           return http.json(res, 200, resposta);
@@ -370,6 +460,8 @@ module.exports = {
 
         // RECONEXÃO CORRIGIDA - Verificar se client está REALMENTE ativo
         const currentSession = Sessions.getClient(session); // CORRIGIDO: getClient em vez de getSession
+        const sessionHelper = require('../../../controllers/helper/core/sessions.js');
+        const injectedClient = sessionHelper.getInjectedClient(session);
         const isClientActive = injectedClient && injectedClient.info;
         
         customLogger.info(`[RECONNECT CHECK] ${session} - Pasta: ${sessionExists} - Status: ${status} - Client ativo: ${!!isClientActive}`);
@@ -462,7 +554,8 @@ module.exports = {
 
     try {
       const data = Sessions.getSession(req.body.session);
-      const number = await buildNumber(req); // AWAIT adicionado
+      const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // AWAIT adicionado
       
       // LIMPAR E VALIDAR BASE64
       let cleanBase64 = base64Data;
@@ -540,7 +633,8 @@ module.exports = {
 
     try {
       const data = Sessions.getSession(req.body.session);
-      const number = await buildNumber(req); // AWAIT adicionado
+      const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente' // AWAIT adicionado
       const results = [];
 
       for (const file of files) {
@@ -597,6 +691,7 @@ module.exports = {
     try {
       const data = Sessions.getSession(req.body.session);
       const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente'
       const results = [];
 
       for (const file of files) {
@@ -666,6 +761,7 @@ module.exports = {
     try {
       const data = Sessions.getSession(req.body.session);
       const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente'
       
       // Criar mensagem de pedido formatada
       let orderText = "🛒 *PEDIDO*\n\n";
@@ -714,6 +810,7 @@ module.exports = {
     try {
       const data = Sessions.getSession(req.body.session);
       const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente'
       
       const poll = new Poll(question, options);
       
@@ -752,9 +849,9 @@ module.exports = {
       const data = Sessions.getSession(req.body.session);
       
       // Buscar a mensagem original
-      const chat = await data.client.getChatById(messageid.split('_')[0] + '@c.us');
+      const chat = await data.client.getChatById(chatDoId(messageid));
       const messages = await chat.fetchMessages({ limit: 50 });
-      const originalMessage = messages.find(msg => msg.id._serialized === messageid);
+      const originalMessage = messages.find(msg => idSerializado(msg.id) === messageid);
       
       if (!originalMessage) {
         return res.status(404).json({
@@ -797,11 +894,12 @@ module.exports = {
     try {
       const data = Sessions.getSession(req.body.session);
       const number = await buildNumber(req);
+    registerSystemMedia(req.body.session, number); // saída do sistema: fromMe sem texto não vira 'atendente'
       
       // Buscar a mensagem para encaminhar
-      const chat = await data.client.getChatById(messageid.split('_')[0] + '@c.us');
+      const chat = await data.client.getChatById(chatDoId(messageid));
       const messages = await chat.fetchMessages({ limit: 50 });
-      const messageToForward = messages.find(msg => msg.id._serialized === messageid);
+      const messageToForward = messages.find(msg => idSerializado(msg.id) === messageid);
       
       if (!messageToForward) {
         return res.status(404).json({
@@ -846,9 +944,9 @@ module.exports = {
       const data = Sessions.getSession(req.body.session);
       
       // Buscar a mensagem com mídia
-      const chat = await data.client.getChatById(messageid.split('_')[0] + '@c.us');
+      const chat = await data.client.getChatById(chatDoId(messageid));
       const messages = await chat.fetchMessages({ limit: 50 });
-      const mediaMessage = messages.find(msg => msg.id._serialized === messageid);
+      const mediaMessage = messages.find(msg => idSerializado(msg.id) === messageid);
       
       if (!mediaMessage) {
         return res.status(404).json({
@@ -866,7 +964,19 @@ module.exports = {
         });
       }
 
+      // A mensagem do fetchMessages traz o id em `$1`: sem o `_serialized`, o downloadMedia do
+      // whatsapp-web.js consulta o WhatsApp Web com id vazio e quebra com erro minificado.
+      if (mediaMessage.id && !mediaMessage.id._serialized) mediaMessage.id._serialized = idSerializado(mediaMessage.id);
+
       const media = await mediaMessage.downloadMedia();
+      if (!media?.data) {
+        // Antes quebrava em `media.mimetype` e o zap só via "Cannot read properties of undefined".
+        return res.status(500).json({
+          result: 500,
+          status: "FAIL",
+          message: "O WhatsApp Web não entregou a mídia (ainda não pronta, expirada ou apagada)"
+        });
+      }
       
       return res.status(200).json({
         result: 200,
@@ -879,10 +989,13 @@ module.exports = {
         size: media.filesize
       });
     } catch (error) {
+      // O erro do WhatsApp Web vem minificado ("t"): vai com nome e mensagem, nunca vazio.
+      const detalhe = [error?.name, error?.message].filter(Boolean).join(': ') || String(error);
+      customLogger.error(`[DOWNLOAD MEDIA] ${messageid}: ${detalhe}`);
       return res.status(500).json({
         result: 500,
         status: "FAIL",
-        message: error.message
+        message: `Falha ao baixar a mídia no WhatsApp Web: ${detalhe}`
       });
     }
   },
@@ -902,9 +1015,9 @@ module.exports = {
       const data = Sessions.getSession(req.body.session);
       
       // Buscar a mensagem para reagir
-      const chat = await data.client.getChatById(messageid.split('_')[0] + '@c.us');
+      const chat = await data.client.getChatById(chatDoId(messageid));
       const messages = await chat.fetchMessages({ limit: 50 });
-      const targetMessage = messages.find(msg => msg.id._serialized === messageid);
+      const targetMessage = messages.find(msg => idSerializado(msg.id) === messageid);
       
       if (!targetMessage) {
         return res.status(404).json({

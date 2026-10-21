@@ -11,6 +11,22 @@ const { checkAPITokenMiddleware } = require('../middlewares/checkAPITokenMiddlew
 const DeviceModel = require('../Models/device.js');
 
 
+// Texto/caption que sai pela API (confirmação de pedido, NF-e, teste do painel)
+// é do SISTEMA: marca antes de enviar para o fromMe não virar "atendente
+// humano falou" e pausar a IA daquele cliente.
+const { registerIAResponse } = require('../controllers/helper/ia/iaResponseCache');
+const marcarSaidaDoSistema = (req, _res, next) => {
+  try {
+    if (/^\/send/i.test(req.path)) {
+      for (const campo of ['text', 'caption', 'message']) {
+        if (typeof req.body?.[campo] === 'string' && req.body[campo].trim()) registerIAResponse(req.body[campo]);
+      }
+    }
+  } catch (_) { /* nunca segura o envio */ }
+  next();
+};
+Router.use(marcarSaidaDoSistema);
+
 Router.post('/start', checkParams, Mensagens.startSession);
 Router.post('/instances', checkAPITokenMiddleware, Sessions.instances);
 

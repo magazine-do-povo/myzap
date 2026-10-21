@@ -58,7 +58,36 @@ function isIAResponse(text) {
   return false;
 }
 
+// Mídia (áudio/foto/arquivo) enviada pelo SISTEMA — voz do bot, anexos da
+// mensagem padrão, PDF pela API — por destino. Sem texto para comparar, é o
+// único jeito de distinguir do áudio/foto que o atendente manda pelo celular.
+const SYSTEM_MEDIA_TTL_MS = 2 * 60 * 1000;
+const systemMedia = new Map();
+// chave = sessão (loja) + id do chat sem o sufixo (@c.us/@lid), que é o que o
+// bot usa ao enviar e o que vem em message.to: duas lojas na mesma VPS falando com o
+// mesmo cliente não podem se marcar uma à outra
+const chaveDestino = (session, destino) => `${String(session || '')}|${String(destino || '').replace(/@.*$/, '').trim()}`;
+
+function registerSystemMedia(session, destino) {
+  const k = chaveDestino(session, destino);
+  if (!String(destino || '').trim()) return;
+  systemMedia.set(k, Date.now() + SYSTEM_MEDIA_TTL_MS);
+  if (systemMedia.size > 500) {
+    for (const [kk, exp] of systemMedia) if (Date.now() > exp) systemMedia.delete(kk);
+  }
+}
+
+function isSystemMedia(session, destino) {
+  const k = chaveDestino(session, destino);
+  const exp = systemMedia.get(k);
+  if (!exp) return false;
+  if (Date.now() > exp) { systemMedia.delete(k); return false; }
+  return true;
+}
+
 module.exports = {
   registerIAResponse,
   isIAResponse,
+  registerSystemMedia,
+  isSystemMedia,
 };

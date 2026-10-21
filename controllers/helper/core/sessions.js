@@ -55,10 +55,17 @@ const SessionsHelper = {
     };
   },
 
+  /**
+   * A MEMÓRIA sai antes do banco: sem o client aqui o health check não vê a sessão, e sem a
+   * linha no banco o keepalive não a religa. Antes, o banco falhando (SQLite ocupado) saltava o
+   * `delete` da memória — a sessão "excluída" seguia viva, era declarada zumbi a cada minuto e o
+   * keepalive mandava `/start` nela (`[START NEW] … Status: ZOMBIE`). Devolve false se o banco
+   * falhou: quem excluiu precisa saber, para repetir.
+   */
   async deleteSessionAndCleanup(session) {
+    delete this.clients[session];
     try {
       await Device.destroy({ where: { session } });
-      delete this.clients[session];
       return true;
     } catch (err) {
       customLogger.error(`[❌ DELETE SESSION] ${session} - ${err.message}`);
@@ -84,21 +91,44 @@ const SessionsHelper = {
     }
   },
 
+  /** Teto por passo ao fechar: o WhatsApp Web às vezes não responde, e a exclusão não pode ficar presa nele. */
+  TETO_FECHAR_MS: 10000,
+
+  /**
+   * Excluir sessão: logout no WhatsApp e DESTRUIR o client. Fechar só a aba (page.close)
+   * deixava o Chrome vivo — na VPS, o navegador de uma sessão excluída em 09/10/2026 seguia de
+   * pé dois dias depois, com 900 MB. O logout do whatsapp-web.js só fecha o navegador se chegar
+   * ao fim (página morta derruba o logout antes), por isso o destroy vem sempre depois:
+   * destroy() no whatsapp-web.js, close() no wppconnect/venom.
+   */
   async fecharSessaoComLogout(data, session) {
+    const client = data?.client;
+    const comTeto = async (promessa) => {
+      let relogio;
+      try {
+        return await Promise.race([
+          promessa,
+          new Promise((_, falha) => { relogio = setTimeout(() => falha(new Error(`sem resposta em ${this.TETO_FECHAR_MS} ms`)), this.TETO_FECHAR_MS); }),
+        ]);
+      } finally {
+        clearTimeout(relogio);
+      }
+    };
     let logout = false, close = false;
 
     try {
-      await data?.client?.logout();
+      await comTeto(client?.logout());
       logout = true;
     } catch (err) {
-      console.log(`[SESSION] ${session} - Erro ao fazer logout`);
+      console.log(`[SESSION] ${session} - Erro ao fazer logout: ${err?.message}`);
     }
 
     try {
-      await data?.client?.page?.close();
+      if (typeof client?.destroy === 'function') await comTeto(client.destroy());
+      else if (typeof client?.close === 'function') await comTeto(client.close());
       close = true;
     } catch (err) {
-      console.log(`[SESSION] ${session} - Erro ao fechar página`);
+      console.log(`[SESSION] ${session} - Erro ao fechar o navegador: ${err?.message}`);
     }
 
     return { logout, close };

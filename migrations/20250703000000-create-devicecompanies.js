@@ -46,6 +46,8 @@ module.exports = {
       created_at: {
         allowNull: false,
         type: Sequelize.DATE,
+        // fn('CURRENT_TIMESTAMP') gera "CURRENT_TIMESTAMP()" — SQL invalido no
+        // sqlite (near "(": syntax error). literal emite a palavra-chave crua.
         defaultValue: Sequelize.literal('CURRENT_TIMESTAMP')
       },
       updated_at: {

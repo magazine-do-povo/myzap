@@ -249,9 +249,10 @@ module.exports = {
    * @param {string} params.session - ID da sessão
    * @param {string} params.sessionkey - Chave da sessão
    * @param {string} params.numero - Número do cliente
+   * @param {string} [params.tipo] - 'aviso_fechada' para o aviso que sai no lugar dela com a loja fechada
    * @returns {Promise<boolean>} true se já enviou hoje
    */
-  async jaEnvieiMensagemPadraoHoje({ session, sessionkey, numero }) {
+  async jaEnvieiMensagemPadraoHoje({ session, sessionkey, numero, tipo = 'mensagem_padrao' }) {
     const since = moment().startOf('day').toDate();
     const record = await ChatHistory.findOne({
       where: {
@@ -259,7 +260,7 @@ module.exports = {
         sessionkey,
         numero_cliente: numero,
         role: 'assistant',
-        message_type: 'mensagem_padrao',
+        message_type: tipo,
         created_at: { [Op.gte]: since },
       },
       order: [['created_at', 'DESC'], ['id', 'DESC']],
@@ -269,8 +270,14 @@ module.exports = {
   },
 
   /**
-   * Verifica se já houve qualquer interação HOJE com este número.
+   * Verifica se A LOJA já falou HOJE com este número (mensagem padrão, IA ou atendente).
    * Usado para determinar se é o primeiro contato do dia.
+   *
+   * A fala do cliente não conta: o EventsController grava a mensagem dele ANTES dos guards,
+   * e contar tudo fazia o próprio "oi" parecer interação anterior — o primeiro contato nunca
+   * disparava para texto e a IA respondia no lugar da mensagem padrão. Só "funcionava"
+   * quando chegava antes um aviso do sistema sem texto (Capucho, 24/09/2026).
+   * O aviso de loja fechada também não conta: a padrão tem de sair quando a loja abrir.
    * @param {Object} params
    * @param {string} params.session - ID da sessão
    * @param {string} params.sessionkey - Chave da sessão
@@ -284,6 +291,8 @@ module.exports = {
         session,
         sessionkey,
         numero_cliente: numero,
+        role: { [Op.ne]: 'user' },
+        [Op.or]: [{ message_type: null }, { message_type: { [Op.ne]: 'aviso_fechada' } }],
         created_at: { [Op.gte]: since },
       },
     });

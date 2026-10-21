@@ -3,6 +3,7 @@ const transcribe = require('../events/audioTranscriber');
 const MessageSender = require('../events/messageSender');
 const MediaDecryptor = require('../events/mediaDecryptor');
 const { ACEITAR_AUDIO, MAX_AUDIO_SIZE, MAX_AUDIO_DURATION } = require('./iaConfig');
+const { registerIAResponse } = require('./iaResponseCache');
 
 /**
  * Processa mensagens de áudio: validações, transcrição e conversão para texto.
@@ -27,40 +28,48 @@ async function processAudio({ message, client, numero, payload, session, session
         return { success: true }; // não é áudio, continua processamento normal
     }
 
+    // Aviso automático sai registrado como fala do SISTEMA: sem isso o eco dele
+    // voltava como "equipe digitou" e calava a IA 30 min — justo quando o
+    // cliente mandava o resumo que o aviso pediu (Sonhare, 29/09 11:30).
+    const avisar = (text) => {
+        registerIAResponse(text);
+        return MessageSender.sendText({ client, to: numero, text });
+    };
+
     // Verificação global de áudio habilitado
     if (!ACEITAR_AUDIO) {
-        await MessageSender.sendText({
-            client,
-            to: numero,
-            text: 'Desculpe, não estou processando áudios no momento. Pode digitar sua mensagem? 😊'
-        });
+        await avisar('Desculpe, não estou processando áudios no momento. Pode digitar sua mensagem? 😊');
         return { success: false, skipAudio: true };
     }
 
-    await MessageSender.sendText({
-        client,
-        to: numero,
-        text: 'Recebi seu áudio. Só um instante enquanto o escuto, já te respondo! 😊🚀'
-    });
+    // Modo agente: sem mensagem intermediária — o "digitando..." e a resposta
+    // em segundos bastam; o aviso só atrapalhava (pedido do JV, 31/08).
+    if (process.env.IA_PROVIDER !== 'agente') {
+        await avisar('Recebi seu áudio. Só um instante enquanto o escuto, já te respondo! 😊🚀');
+    }
 
     if (message.duration && message.duration > MAX_AUDIO_DURATION) {
-        await MessageSender.sendText({
-            client,
-            to: numero,
-            text: `Recebemos seu áudio, mas ele passa de ${MAX_AUDIO_DURATION}s. Pode enviar um resumo rapidinho? 😊`
-        });
+        await avisar(`Recebemos seu áudio, mas ele passa de ${MAX_AUDIO_DURATION}s. Pode enviar um resumo rapidinho? 😊`);
         return { success: false };
     }
 
     try {
         const mediaBuffer = await MediaDecryptor.decryptFile({ client, message });
         if (mediaBuffer.byteLength > MAX_AUDIO_SIZE) {
-            await MessageSender.sendText({
-                client,
-                to: numero,
-                text: 'O áudio ficou grande demais. Poderia enviar algo mais curto? 😉'
-            });
+            await avisar('O áudio ficou grande demais. Poderia enviar algo mais curto? 😉');
             return { success: false };
+        }
+
+        // Modo agente: o Gemini entende o áudio nativamente — segue o OGG cru
+        // em base64 e a transcrição (Whisper) fica de fora do caminho.
+        if (process.env.IA_PROVIDER === 'agente') {
+            message.agenteAudioBase64 = Buffer.from(mediaBuffer).toString('base64');
+            message.agenteAudioMime = message.mimetype || 'audio/ogg';
+            message.body = '';
+            message.type = 'chat';
+            payload.body = '';
+            payload.type = 'chat';
+            return { success: true, message, payload };
         }
 
         const textoTranscrito = await transcribe({ buffer: mediaBuffer, session, sessionkey });
@@ -75,11 +84,7 @@ async function processAudio({ message, client, numero, payload, session, session
         return { success: true, message, payload };
     } catch (err) {
         customLogger.error(`[IA] Erro ao transcrever áudio: ${err.message}`);
-        await MessageSender.sendText({
-            client,
-            to: numero,
-            text: 'Desculpe, não consegui entender o áudio. Pode digitar? 🤔'
-        });
+        await avisar('Desculpe, não consegui entender o áudio. Pode digitar? 🤔');
         return { success: false };
     }
 }

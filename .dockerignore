@@ -11,3 +11,5 @@ docs
 .env
 .envcopy
 .env.otimizacoes
+graphify-out
+test

@@ -52,7 +52,6 @@ const checkParams = async (req, res, next) => {
       });
     }
 
-    console.log(data?.sessionkey, sessionkey);
     if (data?.sessionkey !== sessionkey) {
       return res.status(404).json({
         response: false,

@@ -74,7 +74,8 @@ module.exports = class Wppconnect {
 
       // cria / atualiza device
       const { empresa_nome, api_url } = body;
-      const sysUser = await User.findOne({ where: { email: process.env.EMAIL } });
+      const { getOrCreateSystemUser } = require('../controllers/helper/core/systemUser.js');
+      const sysUser = await getOrCreateSystemUser();
       
       // USAR existingDevice já buscado acima para incrementar attempts_start
       const currentAttemptsStart = existingDevice?.attempts_start || 0;

@@ -321,20 +321,16 @@ Para 31GB RAM: ~200 sessões teóricas (recomendado: 150 máximo).
 
 ## 🚀 Deploy e Produção
 
-### Estrutura VPS
-- **OS:** AlmaLinux 9 (RHEL-based)
-- **Process Manager:** PM2
-- **Caminho:** `/var/www/myzap`
+### Produção (GKE)
+- **Onde:** cluster `jztech-gke-prod`, namespace `myzap`, StatefulSet `myzap` (um pod por shard).
+- **Deploy:** Actions → **Deploy MyZap to GKE** (manual). Ver `docs/jztech/deploy-no-gke.md`.
+- A VPS com PM2 saiu de uso em 18/10/2026: não há mais deploy nem diagnóstico por SSH.
 
 ### Comandos úteis
 ```bash
-pm2 restart myzap
-pm2 logs myzap
-pm2 monit
+kubectl -n myzap get pod
+kubectl -n myzap logs myzap-0 --tail=200
 ```
-
-### GitHub Actions
-Deploy automático configurado em `.github/workflows/deploy.yml`.
 
 ---
 

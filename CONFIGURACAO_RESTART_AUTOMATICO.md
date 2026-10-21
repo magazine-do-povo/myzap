@@ -1,122 +1,72 @@
-# 🚀 CONFIGURAÇÃO DE RESTART AUTOMÁTICO - MYZAP
+# 🚀 REINÍCIO DIÁRIO DO MYZAP
 
-## Para Linux/VPS (usando crontab)
+## O cron não é mais necessário
 
-### 1. Abrir o crontab
+Até 11/10/2026 a recomendação era um cron na VPS:
+
 ```bash
-crontab -e
-```
-
-### 2. Adicionar linha para restart diário às 3h da madrugada
-```bash
-# Restart diário do MYZAP às 3h (horário com menos movimento)
 0 3 * * * pm2 restart myzap
 ```
 
-### 3. Salvar e fechar (Ctrl+X, depois Y, depois Enter)
+Ele **falhava todo dia** com `pm2: command not found`: o pm2 é instalado pelo nvm, dentro
+de `~/.nvm/versions/node/<versão>/bin`, e o cron roda com um PATH mínimo que não passa
+por aí. Resultado: o processo ficava semanas de pé, e o Chrome de cada sessão vaza
+memória (medido em 11/10/2026: de 0,6 a 4,4 GB por sessão).
 
-### 4. Verificar se foi adicionado corretamente
-```bash
-crontab -l
-```
+Agora **o próprio MyZap se reinicia** (`jobs/dailyRestart.js`): na hora marcada ele chama o
+mesmo desligamento limpo do `SIGTERM` (`gracefulShutdown` do `index.js` — fecha os Chromes,
+solta os perfis em `instances/` e sai com código 0) e o PM2 o religa sozinho. Não depende
+de PATH, de cron nem de ninguém.
 
----
-
-## Explicação do Cron
-
-```
-0 3 * * *
-│ │ │ │ │
-│ │ │ │ └─── Dia da semana (0-7, onde 0 e 7 = Domingo)
-│ │ │ └───── Mês (1-12)
-│ │ └─────── Dia do mês (1-31)
-│ └───────── Hora (0-23)
-└─────────── Minuto (0-59)
-```
-
-**0 3 * * *** = Todo dia às 3:00 AM
+**Se a linha ainda estiver no crontab, remova-a** (`crontab -e`) — ela só gera e-mail de erro.
 
 ---
 
-## Outras Opções de Agendamento
+## Configuração (variáveis no `.env`)
 
-### Restart a cada 12 horas (3h e 15h)
-```bash
-0 3,15 * * * pm2 restart myzap
-```
+| Variável | Padrão | O que faz |
+|----------|--------|-----------|
+| `REINICIO_DIARIO` | ligado sob PM2 | `0` desliga; `1` força fora do PM2 (ex.: Docker com `restart: always`) |
+| `REINICIO_DIARIO_HORA` | `3` | Hora do reinício (0–23), fuso `America/Sao_Paulo` |
 
-### Restart semanal (toda segunda às 3h)
-```bash
-0 3 * * 1 pm2 restart myzap
-```
+O job **só nasce ligado quando o processo roda sob o PM2** (variável `pm_id` presente): sem
+um supervisor que religue um processo que saiu com 0, reiniciar seria se matar. No cluster
+(k8s) o CronJob `k8s/reinicio-diario.yaml` já reinicia um pod por vez; nas lojas, o
+gerenciador trata saída como queda — nesses dois lugares o job fica desligado sozinho.
 
-### Restart quinzenal (dia 1 e 15 de cada mês às 3h)
-```bash
-0 3 1,15 * * pm2 restart myzap
-```
-
----
-
-## Para Windows (usando Task Scheduler)
-
-### 1. Criar arquivo restart-myzap.bat
-```bat
-@echo off
-cd C:\caminho\para\myzap
-pm2 restart myzap
-```
-
-### 2. Abrir "Agendador de Tarefas" do Windows
-
-### 3. Criar Nova Tarefa Básica
-- Nome: Restart MYZAP
-- Gatilho: Diariamente às 3:00
-- Ação: Iniciar um programa
-- Programa: Selecionar o arquivo restart-myzap.bat
+Para o reinício ser limpo o PM2 precisa esperar os Chromes fecharem: rode o MyZap **pelo
+`ecosystem.config.js`** (`kill_timeout: 20000`), não por `pm2 start index.js`. Ver o
+cabeçalho do `ecosystem.config.js`.
 
 ---
 
 ## Verificação
 
-### Ver logs do PM2 para confirmar restart
 ```bash
-pm2 logs myzap --lines 50
+# No boot, o job diz quando vai reiniciar:
+pm2 logs myzap --lines 200 | grep "REINICIO DIARIO"
+#   [REINICIO DIARIO] agendado para as 3h (America/Sao_Paulo), daqui a 412 min
+
+# No dia seguinte, o uptime do processo tem de ser de poucas horas:
+pm2 status
 ```
 
-### Ver próximos jobs agendados (Linux)
-```bash
-crontab -l
-```
+---
+
+## Windows (Agendador de Tarefas)
+
+Nas lojas o MyZap roda sob o gerenciador, não sob PM2, e o job fica desligado. Quem roda
+PM2 no Windows tem o mesmo reinício automático; quem não roda e quer um reinício diário
+continua podendo agendar um `.bat` com `pm2 restart myzap` no Agendador de Tarefas.
 
 ---
 
 ## ⚠️ IMPORTANTE
 
-- O restart será RÁPIDO (5-10 segundos)
-- Sessões WhatsApp serão reconectadas automaticamente
+- O reinício é RÁPIDO (até ~20 s para fechar os Chromes + o boot)
+- Sessões WhatsApp reconectam sozinhas pelos tokens em `instances/` (sem QR)
 - Escolha horário com MENOS movimento (madrugada)
-- Com as otimizações implementadas, você pode aumentar o intervalo gradualmente
 
 ---
 
-## 📊 Monitoramento
-
-Após configurar o cron, monitore por alguns dias:
-
-```bash
-# Ver uso de memória
-free -h
-
-# Ver uso de swap
-swapon --show
-
-# Ver processos do PM2
-pm2 status
-
-# Ver logs do sistema
-tail -f /var/www/myzap/logs/info.log
-```
-
----
-
-**Criado por:** GitHub Copilot - Sistema de Otimização MYZAP
+**Atualizado em:** 11/10/2026 — o reinício passou a ser do próprio MyZap
